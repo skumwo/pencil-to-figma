@@ -1,0 +1,24 @@
+{
+  "name": "pencil-to-figma",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Universal bridge: import any pencil.dev .pen design into Figma — images, tokens, auto-layout, components — 1:1.",
+  "type": "module",
+  "scripts": {
+    "build": "node plugin/build.mjs",
+    "watch": "node plugin/build.mjs --watch",
+    "export": "node exporter/cli.mjs",
+    "bridge": "node bridge/server.mjs"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.100.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0"
+  }
+}

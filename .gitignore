@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# User test files — never commit these
+examples/*
+!examples/.gitkeep
+
+# Bridge runtime artifacts (user data outside repo)
+.pencil-to-figma/

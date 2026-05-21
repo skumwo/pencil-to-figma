@@ -1,0 +1,13 @@
+{
+  "name": "Pencil Import",
+  "id": "pencil-to-figma",
+  "api": "1.0.0",
+  "main": "dist/code.js",
+  "ui": "dist/ui.html",
+  "editorType": ["figma"],
+  "networkAccess": {
+    "allowedDomains": ["http://localhost:7777"],
+    "reasoning": "Talks to the local pencil-to-figma bridge that reads .pen files and returns design JSON."
+  },
+  "documentAccess": "dynamic-page"
+}

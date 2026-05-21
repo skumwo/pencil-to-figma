@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "noImplicitAny": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2020", "DOM"],
+    "typeRoots": ["./node_modules/@types"]
+  },
+  "include": [
+    "plugin/src/**/*.ts",
+    "node_modules/@figma/plugin-typings/index.d.ts"
+  ]
+}

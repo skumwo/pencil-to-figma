@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #111111;
+    --fg-muted: #666666;
+    --fg-faint: #888888;
+    --surface: #fafafa;
+    --surface-2: #f4f4f4;
+    --border: #c8c8c8;
+    --accent: #18a0fb;
+    --accent-text: #ffffff;
+    --button-secondary-bg: #eeeeee;
+    --button-secondary-text: #333333;
+    --ok-bg: #e6f7ec;
+    --ok-text: #097935;
+    --err-bg: #fde7e7;
+    --err-text: #b00020;
+    --warn-bg: #fff8e1;
+    --warn-text: #7a5a00;
+    --drop-hover-bg: #eef7ff;
+  }
+  .figma-dark {
+    --bg: #2c2c2c;
+    --fg: #ffffff;
+    --fg-muted: #b0b0b0;
+    --fg-faint: #888888;
+    --surface: #383838;
+    --surface-2: #2a2a2a;
+    --border: #555555;
+    --button-secondary-bg: #4a4a4a;
+    --button-secondary-text: #ffffff;
+    --ok-bg: #1f3a2a;
+    --ok-text: #6fdb96;
+    --err-bg: #4a1f1f;
+    --err-text: #ff7a7a;
+    --warn-bg: #3a3018;
+    --warn-text: #ffd966;
+    --drop-hover-bg: #1a3349;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    background: var(--bg);
+    color: var(--fg);
+    margin: 0;
+    padding: 0;
+  }
+  body {
+    font-family: Inter, -apple-system, system-ui, sans-serif;
+    font-size: 12px;
+    padding: 16px;
+  }
+  h1 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    color: var(--fg);
+  }
+  .hint {
+    color: var(--fg-muted);
+    margin-bottom: 12px;
+    line-height: 1.4;
+  }
+  code {
+    background: var(--surface-2);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+  .drop {
+    border: 1.5px dashed var(--border);
+    border-radius: 8px;
+    padding: 24px 12px;
+    text-align: center;
+    cursor: pointer;
+    background: var(--surface);
+    transition: all 0.15s;
+    margin-bottom: 12px;
+    color: var(--fg);
+    display: block;
+  }
+  .drop.hover {
+    border-color: var(--accent);
+    background: var(--drop-hover-bg);
+  }
+  .drop strong {
+    display: block;
+    margin-bottom: 4px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .drop span {
+    color: var(--fg-faint);
+    font-size: 11px;
+  }
+  input[type=file] { display: none; }
+  .row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  button {
+    flex: 1;
+    border: 0;
+    background: var(--accent);
+    color: var(--accent-text);
+    padding: 8px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 500;
+    font-size: 12px;
+  }
+  button.secondary {
+    background: var(--button-secondary-bg);
+    color: var(--button-secondary-text);
+  }
+  button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .status {
+    margin-top: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: var(--surface-2);
+    color: var(--fg-muted);
+    font-size: 11px;
+    display: none;
+    line-height: 1.4;
+  }
+  .status.error { background: var(--err-bg); color: var(--err-text); }
+  .status.ok    { background: var(--ok-bg);  color: var(--ok-text); }
+  .status.warn  { background: var(--warn-bg); color: var(--warn-text); }
+  .meta {
+    display: none;
+    background: var(--surface-2);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 12px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--fg);
+  }
+  .meta b { font-weight: 600; }
+  .options {
+    margin-top: 14px;
+    padding: 12px;
+    background: var(--surface);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+  }
+  .options-title {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-faint);
+    margin-bottom: 10px;
+  }
+  label.opt {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin: 8px 0;
+    font-size: 12px;
+    color: var(--fg);
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  label.opt input[type=checkbox] {
+    margin-top: 2px;
+    flex: none;
+  }
+  label.opt b {
+    display: block;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  label.opt .opt-desc {
+    display: block;
+    color: var(--fg-muted);
+    font-size: 11px;
+    font-weight: 400;
+    margin-top: 1px;
+  }
+  .bridge-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 10px;
+    color: var(--fg-faint);
+    margin-bottom: 8px;
+  }
+  .pill {
+    background: var(--surface-2);
+    color: var(--fg-muted);
+    padding: 2px 6px;
+    border-radius: 10px;
+    font-size: 10px;
+  }
+  .pill.ok { background: var(--ok-bg); color: var(--ok-text); }
+  .pill.err { background: var(--err-bg); color: var(--err-text); }
+  .tabs {
+    display: flex;
+    gap: 0;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .tab {
+    background: none;
+    color: var(--fg-muted);
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: 8px 12px;
+    font-size: 11px;
+    flex: none;
+    cursor: pointer;
+  }
+  .tab.active {
+    color: var(--fg);
+    border-bottom-color: var(--accent);
+  }
+  .pane { display: none; }
+  .pane.active { display: block; }
+</style>
+</head>
+<body>
+<h1>Pencil → Figma</h1>
+<div class="bridge-row">
+  <span>Bridge:</span>
+  <span id="bridge-status" class="pill">checking…</span>
+  <button id="check-bridge" class="secondary" style="padding:2px 8px;font-size:10px;flex:none;">retry</button>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="pen">Drop .pen + images</button>
+  <button class="tab" data-tab="json">Drop design.json</button>
+</div>
+
+<!-- Tab 1: drop .pen + folder -->
+<div class="pane active" data-pane="pen">
+  <div class="hint">Drop the <code>.pen</code> file and the images folder — bridge processes them and the plugin imports the result.</div>
+  <div class="drop" id="drop-pen">
+    <strong>Drop .pen + images folder here</strong>
+    <span>Both at once, or use the buttons below.</span>
+  </div>
+  <div class="row" style="margin-top:-4px;">
+    <label class="secondary" style="flex:1;background:var(--button-secondary-bg);color:var(--button-secondary-text);padding:8px 12px;border-radius:6px;text-align:center;cursor:pointer;font-size:11px;font-weight:500;">
+      <span id="pen-label">Pick .pen file</span>
+      <input type="file" id="file-pen" accept=".pen,application/octet-stream" />
+    </label>
+    <label class="secondary" style="flex:1;background:var(--button-secondary-bg);color:var(--button-secondary-text);padding:8px 12px;border-radius:6px;text-align:center;cursor:pointer;font-size:11px;font-weight:500;">
+      <span id="folder-label">Pick images folder</span>
+      <input type="file" id="file-folder" webkitdirectory multiple />
+    </label>
+  </div>
+  <div class="meta" id="meta-pen"></div>
+  <div class="row">
+    <button id="import-pen" disabled>Process &amp; Import</button>
+    <button id="clear-pen" class="secondary">Clear</button>
+  </div>
+</div>
+
+<!-- Tab 2: drop pre-exported JSON -->
+<div class="pane" data-pane="json">
+  <div class="hint">Drop a <code>design.json</code> already produced by <code>/pen-export</code> or <code>node exporter/cli.mjs</code>.</div>
+  <label class="drop" id="drop-json">
+    <strong>Drop JSON or click</strong>
+    <span>Skip the bridge — useful for repeat imports.</span>
+    <input type="file" id="file-json" accept=".json,application/json" />
+  </label>
+  <div class="meta" id="meta-json"></div>
+  <div class="row">
+    <button id="import-json" disabled>Import</button>
+    <button id="clear-json" class="secondary">Clear</button>
+  </div>
+</div>
+
+<div class="options">
+  <div class="options-title">Options</div>
+  <label class="opt">
+    <input type="checkbox" id="frameWrap" />
+    <span>
+      <b>Wrap everything in one frame</b>
+      <span class="opt-desc">Put all imported pages inside a single "Pencil Import" container frame. Off = pages dropped directly on the canvas.</span>
+    </span>
+  </label>
+  <label class="opt">
+    <input type="checkbox" id="centerView" checked />
+    <span>
+      <b>Scroll viewport to the import</b>
+      <span class="opt-desc">After importing, Figma will zoom & scroll to the new pages so you see them right away.</span>
+    </span>
+  </label>
+</div>
+
+<div class="status" id="status"></div>
+
+<script>
+  const BRIDGE_URL = "http://localhost:7777";
+  const $ = (id) => document.getElementById(id);
+
+  // ─── Tabs ──────────────────────────────────────────────────────────────────
+  document.querySelectorAll(".tab").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === btn));
+      document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === btn.dataset.tab));
+    });
+  });
+
+  // ─── Status ────────────────────────────────────────────────────────────────
+  const status = $("status");
+  function showStatus(text, kind) {
+    status.className = "status " + (kind || "");
+    status.textContent = text;
+    status.style.display = "block";
+  }
+  function hideStatus() { status.style.display = "none"; }
+
+  // ─── Bridge health check ───────────────────────────────────────────────────
+  const bridgePill = $("bridge-status");
+  async function checkBridge() {
+    bridgePill.className = "pill"; bridgePill.textContent = "checking…";
+    try {
+      const r = await fetch(BRIDGE_URL + "/health", { method: "GET" });
+      if (r.ok) {
+        bridgePill.className = "pill ok"; bridgePill.textContent = "online";
+        return true;
+      }
+    } catch (e) {}
+    bridgePill.className = "pill err"; bridgePill.textContent = "offline";
+    return false;
+  }
+  $("check-bridge").addEventListener("click", checkBridge);
+  checkBridge();
+
+  // ─── Tree summary ──────────────────────────────────────────────────────────
+  function summarize(t) {
+    let nodes = 0, images = 0, texts = 0;
+    function walk(n) {
+      if (!n || typeof n !== "object") return;
+      nodes++;
+      if (n.type === "text") texts++;
+      const fillArr = Array.isArray(n.fill) ? n.fill : (n.fill ? [n.fill] : []);
+      for (const f of fillArr) {
+        if (f && typeof f === "object" && f.type === "image") images++;
+      }
+      if (Array.isArray(n.children)) n.children.forEach(walk);
+    }
+    if (Array.isArray(t)) t.forEach(walk); else walk(t);
+    return { nodes, images, texts };
+  }
+
+  function getOpts() {
+    return { frameWrap: $("frameWrap").checked, centerView: $("centerView").checked };
+  }
+
+  function sendImport(tree) {
+    parent.postMessage({ pluginMessage: { type: "import", tree, opts: getOpts() } }, "*");
+  }
+
+  // ─── Pane 1: .pen + folder ────────────────────────────────────────────────
+  const dropPen = $("drop-pen");
+  const filePenInput = $("file-pen");
+  const fileFolderInput = $("file-folder");
+  const penLabel = $("pen-label");
+  const folderLabel = $("folder-label");
+  const metaPen = $("meta-pen");
+  const importPenBtn = $("import-pen");
+
+  // State: kept across separate pickers so dropping a folder doesn't clobber the .pen, and vice versa.
+  let penFile = null;
+  let imageFiles = [];
+
+  function renderPen() {
+    penLabel.textContent = penFile ? ("✓ " + penFile.name) : "Pick .pen file";
+    folderLabel.textContent = imageFiles.length ? ("✓ " + imageFiles.length + " image" + (imageFiles.length === 1 ? "" : "s")) : "Pick images folder";
+    if (!penFile && !imageFiles.length) {
+      metaPen.style.display = "none";
+    } else {
+      metaPen.innerHTML =
+        "<b>" + (penFile ? penFile.name : "no .pen file yet") + "</b><br>" +
+        imageFiles.length + " image" + (imageFiles.length === 1 ? "" : "s") + " staged";
+      metaPen.style.display = "block";
+    }
+    importPenBtn.disabled = !penFile;
+    hideStatus();
+  }
+
+  function addFiles(files) {
+    // Separate .pen from images, accumulate into state.
+    for (const f of files) {
+      if (/\.pen$/i.test(f.name)) {
+        penFile = f;
+      } else if (/\.(png|jpe?g|gif|webp|svg)$/i.test(f.name)) {
+        // Dedupe by relative path so re-picking the same folder doesn't double-count
+        const rel = f._relPath || f.webkitRelativePath || f.name;
+        const existing = imageFiles.findIndex(
+          (x) => (x._relPath || x.webkitRelativePath || x.name) === rel
+        );
+        if (existing >= 0) imageFiles[existing] = f;
+        else imageFiles.push(f);
+      }
+    }
+    renderPen();
+  }
+
+  filePenInput.addEventListener("change", (e) => {
+    const f = e.target.files[0];
+    if (f) addFiles([f]);
+  });
+  fileFolderInput.addEventListener("change", (e) => {
+    addFiles([...e.target.files]);
+  });
+
+  dropPen.addEventListener("dragover", (e) => { e.preventDefault(); dropPen.classList.add("hover"); });
+  dropPen.addEventListener("dragleave", () => dropPen.classList.remove("hover"));
+  dropPen.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    dropPen.classList.remove("hover");
+    const items = e.dataTransfer.items;
+    const files = [];
+    const pending = [];
+    for (const item of items) {
+      const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+      if (entry) {
+        pending.push(traverseEntry(entry, "", files));
+      } else {
+        const f = item.getAsFile && item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    await Promise.all(pending);
+    addFiles(files);
+  });
+
+  async function traverseEntry(entry, prefix, out) {
+    if (entry.isFile) {
+      await new Promise((resolve) => entry.file((f) => {
+        // store relative path so the bridge can match nested image references
+        Object.defineProperty(f, "_relPath", { value: prefix + entry.name });
+        out.push(f);
+        resolve();
+      }));
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const entries = await new Promise((resolve) => reader.readEntries(resolve));
+      for (const e of entries) {
+        await traverseEntry(e, prefix + entry.name + "/", out);
+      }
+    }
+  }
+
+  importPenBtn.addEventListener("click", async () => {
+    if (!(await checkBridge())) {
+      showStatus("Bridge offline. Run:  npm run bridge", "err");
+      return;
+    }
+    if (!penFile) { showStatus("Pick a .pen file first.", "err"); return; }
+
+    importPenBtn.disabled = true;
+    showStatus("Uploading to bridge…");
+
+    const fd = new FormData();
+    fd.append("pen", penFile, penFile.name);
+    for (const f of imageFiles) {
+      const rel = f._relPath || f.webkitRelativePath || f.name;
+      fd.append("image", f, rel);
+    }
+
+    try {
+      const r = await fetch(BRIDGE_URL + "/import", { method: "POST", body: fd });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ("HTTP " + r.status));
+      }
+      const { tree, stats } = await r.json();
+      showStatus(
+        "Bridge → " + stats.embedded + "/" + stats.total + " images embedded. Sending to canvas…"
+      );
+      sendImport(tree);
+    } catch (e) {
+      showStatus("Bridge error: " + (e?.message || e), "err");
+      importPenBtn.disabled = false;
+    }
+  });
+
+  $("clear-pen").addEventListener("click", () => {
+    penFile = null;
+    imageFiles = [];
+    filePenInput.value = "";
+    fileFolderInput.value = "";
+    renderPen();
+    hideStatus();
+  });
+
+  // ─── Pane 2: drop pre-exported JSON ────────────────────────────────────────
+  const dropJson = $("drop-json");
+  const fileJson = $("file-json");
+  const metaJson = $("meta-json");
+  const importJsonBtn = $("import-json");
+  let parsedTree = null;
+
+  async function loadJson(f) {
+    try {
+      const text = await f.text();
+      parsedTree = JSON.parse(text);
+      const s = summarize(parsedTree);
+      metaJson.innerHTML =
+        "<b>" + f.name + "</b><br>" +
+        s.nodes + " nodes · " + s.texts + " texts · " + s.images + " images";
+      metaJson.style.display = "block";
+      importJsonBtn.disabled = false;
+      hideStatus();
+    } catch (e) {
+      parsedTree = null;
+      metaJson.style.display = "none";
+      importJsonBtn.disabled = true;
+      showStatus("Invalid JSON: " + e.message, "err");
+    }
+  }
+  fileJson.addEventListener("change", (e) => { const f = e.target.files[0]; if (f) loadJson(f); });
+  dropJson.addEventListener("dragover", (e) => { e.preventDefault(); dropJson.classList.add("hover"); });
+  dropJson.addEventListener("dragleave", () => dropJson.classList.remove("hover"));
+  dropJson.addEventListener("drop", (e) => {
+    e.preventDefault(); dropJson.classList.remove("hover");
+    const f = e.dataTransfer.files[0]; if (f) loadJson(f);
+  });
+  importJsonBtn.addEventListener("click", () => {
+    if (!parsedTree) return;
+    importJsonBtn.disabled = true;
+    showStatus("Importing…");
+    sendImport(parsedTree);
+  });
+  $("clear-json").addEventListener("click", () => {
+    parsedTree = null;
+    fileJson.value = "";
+    metaJson.style.display = "none";
+    importJsonBtn.disabled = true;
+    hideStatus();
+  });
+
+  // ─── Plugin response ───────────────────────────────────────────────────────
+  window.addEventListener("message", (e) => {
+    const msg = e.data.pluginMessage;
+    if (!msg) return;
+    if (msg.type === "done") {
+      showStatus("Imported " + msg.count + " nodes", "ok");
+      importPenBtn.disabled = false;
+      importJsonBtn.disabled = false;
+    } else if (msg.type === "error") {
+      showStatus(msg.error, "err");
+      importPenBtn.disabled = false;
+      importJsonBtn.disabled = false;
+    } else if (msg.type === "progress") {
+      showStatus(msg.text);
+    }
+  });
+</script>
+</body>
+</html>
