@@ -36,18 +36,32 @@ export async function embedImages(tree, baseDir, extraSearch = []) {
     return null;
   }
 
+  // A Pencil `fill` (and `stroke`) is `Fill | Fill[]` — a layer can stack an image
+  // under a gradient scrim. Passing the array straight to embedFill silently did
+  // nothing (an array has no `.type`), so stacked image fills were never embedded
+  // and reached the plugin as a bare URL it had to drop.
+  async function embedFills(value) {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      for (const f of value) await embedFill(f);
+    } else {
+      await embedFill(value);
+    }
+  }
+
   async function walk(node) {
     if (!node || typeof node !== "object") return;
-    // Single fill
-    if (node.fill) await embedFill(node.fill);
-    // Array of fills
-    if (Array.isArray(node.fills)) for (const f of node.fills) await embedFill(f);
-    // Stroke fill
-    if (node.stroke && node.stroke.fill) await embedFill(node.stroke.fill);
+    await embedFills(node.fill);
+    await embedFills(node.fills);
+    // `stroke` is itself a Fills value; older exports nested it under `.fill`.
+    await embedFills(node.stroke);
+    if (node.stroke && !Array.isArray(node.stroke) && node.stroke.fill) {
+      await embedFills(node.stroke.fill);
+    }
     // Text fills
     if (node.text) {
-      if (node.text.fill) await embedFill(node.text.fill);
-      if (Array.isArray(node.text.fills)) for (const f of node.text.fills) await embedFill(f);
+      await embedFills(node.text.fill);
+      await embedFills(node.text.fills);
     }
     if (Array.isArray(node.children)) for (const c of node.children) await walk(c);
   }

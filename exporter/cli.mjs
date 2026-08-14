@@ -1,26 +1,36 @@
 #!/usr/bin/env node
-// pencil-to-figma standalone exporter
+// pencil-to-figma standalone exporter (mode B)
 //
 // Usage:
 //   node exporter/cli.mjs <path-to-design.pen> [--out design.json] [--node <rootId>]
 //
 // What it does:
-//   1. Spawns the Pencil MCP server (npx @pencil-dev/mcp or env PENCIL_MCP_CMD)
+//   1. Spawns the Pencil MCP server (auto-discovered, or env PENCIL_MCP_CMD)
 //   2. Opens the document
-//   3. Snapshots the full layout tree
-//   4. Fetches design variables (color tokens, etc.) and resolves all $token refs to concrete values
-//   5. Embeds image fills as base64 (reads files from the .pen file's directory)
-//   6. Writes a single design.json ready to drop into the Figma plugin
+//   3. Fetches the COMPLETE design tree via batch_get, expanding every truncated
+//      subtree (see exporter/lib/fetch-tree.mjs)
+//   4. Fetches design variables and resolves all $token refs to concrete values
+//   5. Resolves `icon` nodes to real SVG vectors (PNG fallback via Pencil)
+//   6. Embeds image fills as base64 (reads files from the .pen file's directory)
+//   7. Writes a single design.json ready to drop into the Figma plugin
 //
-// If you don't have Pencil MCP installed: set PENCIL_MCP_CMD to its launch command.
-//   PENCIL_MCP_CMD="node /path/to/pencil-mcp/server.js" node exporter/cli.mjs design.pen
+// This produces the SAME payload the bridge serves in mode A — it shares the same
+// pipeline module, so the two modes can't drift apart.
+//
+// NOTE: an earlier version built the tree from `snapshot_layout`, which returns
+// geometry ONLY (id/x/y/width/height). The JSON had no types, no fills, no text and
+// no icons, so the plugin could only ever draw a stack of blank boxes from it.
 
 import { writeFile } from "node:fs/promises";
 import { resolve, dirname, basename, extname } from "node:path";
 import { existsSync } from "node:fs";
-import { McpClient } from "./lib/mcp-client.mjs";
+import { McpClient, findPencilMcp } from "./lib/mcp-client.mjs";
 import { resolveTokens, normalizeVariables } from "./lib/resolve-tokens.mjs";
 import { embedImages } from "./lib/embed-images.mjs";
+import {
+  RESOLVE_OPTS, fetchFullTree, countTreeNodes, resolveIcons, resolveOpenDocument,
+} from "./lib/fetch-tree.mjs";
+import { availableLibraries } from "./lib/icon-svg.mjs";
 
 function parseArgs(argv) {
   const args = { _: [], out: null, node: null };
@@ -42,13 +52,20 @@ Usage:
 
 Options:
   -o, --out <file>     output path (default: <design>.json next to .pen)
-  -n, --node <id>      export only this node (default: full document)
+  -n, --node <id>      export only this top-level frame (default: all of them)
   -h, --help
 
 Environment:
-  PENCIL_MCP_CMD       override MCP launch command (default: "npx -y @pencil-dev/mcp")
+  PENCIL_MCP_CMD       override the MCP binary path (default: auto-discover
+                       Pen.app / Pencil.app under /Applications)
+  PENCIL_MCP_ARGS      override MCP args (default: "--app desktop")
+
+Note: the Pencil desktop app must be running, and no other MCP client may be
+attached to it (Pencil serves one client at a time).
 `);
 }
+
+const log = (m) => console.error(m);
 
 async function main() {
   const args = parseArgs(process.argv);
@@ -67,43 +84,112 @@ async function main() {
     ? resolve(args.out)
     : resolve(dirname(penPath), basename(penPath, extname(penPath)) + ".json");
 
-  // Resolve MCP launch command
-  const cmd = process.env.PENCIL_MCP_CMD || "npx -y @pencil-dev/mcp";
-  const [command, ...cmdArgs] = cmd.split(/\s+/);
-  console.error(`[mcp] starting: ${cmd}`);
+  const command = process.env.PENCIL_MCP_CMD || findPencilMcp();
+  if (!command) {
+    console.error(
+      "Pencil/Pen desktop app not found in /Applications or ~/Applications.\n" +
+      "Set PENCIL_MCP_CMD=/path/to/mcp-server-darwin-arm64 and retry."
+    );
+    process.exit(1);
+  }
+  const cmdArgs = (process.env.PENCIL_MCP_ARGS || "--app desktop").split(/\s+/).filter(Boolean);
+  log(`[mcp] starting: ${command} ${cmdArgs.join(" ")}`);
+  log(`[icons] vectors available for: ${availableLibraries().join(", ") || "(none — run npm install)"}`);
   const mcp = new McpClient(command, cmdArgs);
 
   try {
     await mcp.start();
-    console.error(`[mcp] initialized`);
+    log(`[mcp] initialized`);
 
-    console.error(`[pen] open ${penPath}`);
-    await mcp.tool("open_document", { path: penPath });
+    // Pencil MCP only exports the document open in its editor, so confirm that's the
+    // file we were asked for rather than silently exporting whatever happens to be open.
+    const { workingPath } = await resolveOpenDocument(
+      mcp, { name: basename(penPath), path: penPath }, process.env.PEN_ALLOW_MISMATCH === "1", log
+    );
 
-    console.error(`[pen] snapshot_layout (maxDepth: 20)…`);
-    const snapshot = await mcp.tool("snapshot_layout", {
-      ...(args.node ? { nodeId: args.node } : {}),
-      maxDepth: 20,
-    });
+    let topLevel = null;
+    let lastErr = null;
+    for (let retry = 0; retry < 3 && !topLevel; retry++) {
+      try {
+        const a = { readDepth: 1, ...RESOLVE_OPTS };
+        if (workingPath) a.filePath = workingPath;
+        const result = await mcp.tool("batch_get", a);
+        const arr = Array.isArray(result) ? result : [result];
+        if (arr.length && arr[0]) {
+          topLevel = arr;
+          log(`[pen] batch_get OK (${arr.length} top-level items)`);
+        } else {
+          // Pencil can race the doc-open against the first batch_get.
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      } catch (e) {
+        lastErr = e;
+        log(`[pen] batch_get error: ${e.message}`);
+        break;
+      }
+    }
+    if (!topLevel) {
+      throw lastErr || new Error(
+        "Could not read the .pen file via Pencil MCP. Make sure the Pencil desktop app is " +
+        "responsive and no other MCP client (e.g. Claude Code) is attached."
+      );
+    }
 
-    console.error(`[pen] get_variables…`);
-    const variablesRaw = await mcp.tool("get_variables", {});
-    const variables = normalizeVariables(variablesRaw);
-    console.error(`[pen] ${Object.keys(variables).length} variables found`);
+    // Import every top-level frame that isn't a reusable component — components are
+    // inlined into their instances by resolveInstances.
+    const rootIds = args.node
+      ? [args.node]
+      : topLevel.filter((n) => n && n.type === "frame" && n.reusable !== true).map((n) => n.id);
+    if (!rootIds.length) throw new Error("No importable top-level frames found in the .pen file");
+    log(`[pen] exporting ${rootIds.length} top-level frame(s): ${rootIds.join(", ")}`);
 
-    // The snapshot can be an array (top-level nodes) or an object. Normalize.
-    let tree = snapshot;
-    if (Array.isArray(tree) && tree.length === 1) tree = tree[0];
+    log(`[pen] get_variables…`);
+    const variables = normalizeVariables(await mcp.tool("get_variables", {}));
+    log(`[pen] ${Object.keys(variables).length} variables found`);
 
-    console.error(`[step] resolve tokens…`);
-    tree = resolveTokens(tree, variables);
+    // Full tree per root, sequentially (Pencil MCP doesn't love parallel calls).
+    const trees = [];
+    let incomplete = 0;
+    for (const id of rootIds) {
+      const r = await fetchFullTree(mcp, id, workingPath, log);
+      trees.push(r.tree);
+      incomplete += r.incomplete;
+    }
 
-    console.error(`[step] embed images (this reads referenced files from ${dirname(penPath)})…`);
-    const stats = await embedImages(tree, dirname(penPath));
-    console.error(`[step] embedded ${stats.cachedBytes} unique images (${stats.total} refs, ${stats.missing} missing)`);
+    log(`[step] resolve tokens…`);
+    const resolved = trees.map((t) => resolveTokens(t, variables));
 
-    await writeFile(outPath, JSON.stringify(tree, null, 2), "utf8");
-    console.error(`[ok] wrote ${outPath}`);
+    log(`[step] resolve icons…`);
+    let icons = null;
+    try {
+      icons = await resolveIcons(mcp, resolved, workingPath, log);
+    } catch (e) {
+      log(`[icons] processing failed: ${e.message}`);
+    }
+
+    log(`[step] embed images (reading from ${dirname(penPath)})…`);
+    let imgTotal = 0, imgMissing = 0;
+    for (const t of resolved) {
+      const s = await embedImages(t, dirname(penPath));
+      imgTotal += s.total;
+      imgMissing += s.missing;
+    }
+    log(`[step] embedded ${imgTotal - imgMissing}/${imgTotal} images (${imgMissing} missing)`);
+
+    const nodes = resolved.reduce((s, t) => s + countTreeNodes(t), 0);
+    // Single root → emit the object; several → emit the array. The plugin accepts both.
+    await writeFile(outPath, JSON.stringify(resolved.length === 1 ? resolved[0] : resolved, null, 2), "utf8");
+
+    log("");
+    log(`[ok] wrote ${outPath}`);
+    log(`     frames  : ${resolved.length}`);
+    log(`     nodes   : ${nodes}`);
+    log(`     images  : ${imgTotal - imgMissing}/${imgTotal} embedded`);
+    if (icons) log(`     icons   : ${icons.vectors} vectors, ${icons.rasterized} rasterized, of ${icons.total}`);
+    if (incomplete) log(`     WARNING : ${incomplete} subtree(s) could not be expanded — the export is incomplete`);
+    log("");
+    log(`Next: Figma → Plugins → Development → Pencil Import → tab "Drop design.json" → drop ${basename(outPath)}`);
+    if (incomplete) process.exitCode = 3;
   } catch (err) {
     console.error(`[error] ${err?.stack || err?.message || err}`);
     process.exit(2);

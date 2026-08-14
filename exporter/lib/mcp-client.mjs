@@ -2,6 +2,28 @@
 // Spawns a child process and exposes a `call(method, params)` Promise API.
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+// The desktop app has shipped under more than one bundle name (Pencil.app, and
+// Pen.app after the rebrand), and Apple Silicon vs Intel builds use different
+// binary names. Probe the known layouts instead of hard-coding one path, so a
+// rename doesn't silently break every import with "no such file".
+export function findPencilMcp() {
+  const apps = ["Pen.app", "Pencil.app"];
+  const roots = ["/Applications", join(homedir(), "Applications")];
+  const bins = ["mcp-server-darwin-arm64", "mcp-server-darwin-amd64", "mcp-server"];
+  for (const root of roots) {
+    for (const app of apps) {
+      for (const bin of bins) {
+        const p = join(root, app, "Contents", "Resources", "app.asar.unpacked", "out", bin);
+        if (existsSync(p)) return p;
+      }
+    }
+  }
+  return null;
+}
 
 export class McpClient {
   /**
@@ -100,8 +122,8 @@ export class McpClient {
     });
   }
 
-  async tool(name, args = {}) {
-    const res = await this.call("tools/call", { name, arguments: args });
+  async tool(name, args = {}, timeoutMs) {
+    const res = await this.call("tools/call", { name, arguments: args }, timeoutMs);
     // The MCP tools/call result wraps tool output in `content`. Pencil tools
     // typically return JSON-as-text or plain text. We try to parse text content.
     if (res && Array.isArray(res.content)) {

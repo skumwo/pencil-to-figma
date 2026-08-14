@@ -101,20 +101,49 @@ JSON экспортируется через **Claude Code** с подключё
 
 | Свойство Pencil | Figma |
 |---|---|
-| `frame` / `rectangle` / `ellipse` / `line` / `text` / `vector` | соответствующие SceneNode типы |
+| `frame` / `rectangle` / `ellipse` / `line` / `polygon` / `text` / `path` | соответствующие SceneNode типы |
+| `group` | frame без заливки и клипа, размер по bounding box детей |
+| `icon` (`library` + `icon`) | **реальные редактируемые векторы** из исходного SVG набора |
+| `note` / `prompt` / `context` | TextNode |
 | `fill: image` (URL → base64) | `figma.createImage` + ImagePaint |
 | `fill: color: $token` | резолвится в `#hex` до загрузки |
 | `fill: gradient` (linear/radial/angular/diamond) | GradientPaint всех типов |
-| `stroke` (thickness, alignment) | strokes + strokeWeight + strokeAlign |
+| `stroke` + `strokeWidth` (число или `{top,right,bottom,left}`) | strokes + strokeWeight + per-side weights |
+| `strokeAlignment` (inner/center/outer), `strokeLinecap`, `strokeLinejoin` | strokeAlign / strokeCap / strokeJoin |
 | `cornerRadius` (число или массив из 4 углов) | cornerRadius / topLeftRadius / … |
-| `layout: vertical/horizontal/none` + padding + gap | layoutMode + padding + itemSpacing |
-| `primaryAxisSize/counterAxisSize` (`fill_container` / `fit_content` / number) | `FILL` / `HUG` / `FIXED` sizing modes |
-| `justifyContent` / `alignItems` | primaryAxisAlignItems / counterAxisAlignItems |
+| `layout: vertical/horizontal` + padding + gap | layoutMode + padding + itemSpacing |
+| `layout: none` | абсолютное позиционирование детей (x/y сохраняются) |
+| `width`/`height`: `fill_container` / `fit_content` / число / `fit_content(100)` | `FILL` / `HUG` / `FIXED` sizing modes |
+| `justifyContent` / `alignItems` (вкл. `space_between`, `space_around`) | primaryAxisAlignItems / counterAxisAlignItems |
+| `textGrowth` (auto / fixed-width / fixed-width-height) | textAutoResize WIDTH_AND_HEIGHT / HEIGHT / NONE |
 | `clip: true` | clipsContent |
-| `opacity`, `rotation`, `visible`, `blendMode` | соответствующие свойства |
-| `effects` (drop_shadow / inner_shadow / blur) | DROP_SHADOW / INNER_SHADOW / LAYER_BLUR |
-| text: family / weight / size / letterSpacing / lineHeight / textAlign / textCase | соответствующие свойства TextNode |
+| `enabled: false` | `visible = false` (в т.ч. «удаление» узла в инстансе) |
+| `opacity`, `rotation`, `blendMode` | соответствующие свойства |
+| `flipX` / `flipY` | зеркалирование (для икон и path — запекается в геометрию) |
+| `effect`: `shadow` (`shadowType: inner/outer`), `blur`, `background_blur` | DROP_SHADOW / INNER_SHADOW / LAYER_BLUR / BACKGROUND_BLUR |
+| `fillRule: evenodd` | сохраняется — внутренние контуры остаются дырками |
+| `innerRadius` / `startAngle` / `sweepAngle` у ellipse | `arcData` (кольца, пироги, дуги) |
+| `polygonCount` | `pointCount` |
+| text: family / weight / style / size / letterSpacing / lineHeight / textAlign / underline / strikethrough | соответствующие свойства TextNode |
 | `ref` (инстансы компонентов) | развёрнуты с overrides через `resolveInstances` |
+
+### Иконки
+
+Pencil-узел `icon` содержит только ссылку на глиф (`library` + `icon`), без геометрии.
+Bridge находит исходный SVG в npm-наборе и отдаёт разметку плагину, который импортирует
+её как **настоящие векторы Figma** (не PNG) и красит в цвет из `fill` узла.
+
+Поддерживаются все библиотеки из схемы `.pen`:
+
+| `library` | npm-пакет |
+|---|---|
+| `lucide` | `lucide-static` |
+| `feather` | `feather-icons` |
+| `phosphor` | `@phosphor-icons/core` (все веса: thin/light/regular/bold) |
+| `Material Symbols Outlined` / `Rounded` / `Sharp` | `@material-symbols/svg-400` |
+
+Если глиф не найден (незнакомая библиотека или опечатка в имени), bridge растеризует
+его через Pencil в PNG как fallback, а имя пишет в лог: `[icons] no SVG for: …`.
 
 ---
 
@@ -173,9 +202,17 @@ esbuild будет ребилдить `dist/` при каждом изменен
 
 ## Известные ограничения
 
-- **Pencil desktop должен быть открыт** для режима A — MCP-сервер это тонкий шим, реальную работу с `.pen` файлом делает само приложение.
-- **Один MCP клиент за раз** — если у тебя параллельно работает Claude Code с подключённым Pencil MCP, bridge может не получить ответ. Закрой Claude Code на время импорта или используй режим B (JSON).
+- **Импортируется только тот файл, который открыт в Pencil.** MCP-сервер — тонкий шим: он отдаёт документ из редактора и не умеет читать закрытые файлы (`open_document` есть не во всех сборках, а `batch_get` с `filePath` на неоткрытый файл просто висит до таймаута). Поэтому drop-зона плагина — это не «загрузи файл», а «укажи, какой из открытых файлов брать»: bridge спрашивает у Pencil путь активного документа, сверяет его с тем, что ты скинула, и **отказывается импортировать другой файл** вместо молчаливой подмены. Открой нужный `.pen` в Pencil перед импортом. Если подмена нужна осознанно — `PEN_ALLOW_MISMATCH=1 npm run bridge`.
+- **Несохранённые правки попадут в импорт.** Pencil отдаёт своё in-memory состояние, а не то, что лежит на диске. Если имя совпало, а байты нет, bridge пишет об этом `NOTE` в лог.
+- **Один MCP клиент за раз** — если у тебя параллельно работает Claude Code с подключённым Pencil MCP, bridge может не получить ответ (`you are probably referencing the wrong .pen file`). Закрой Claude Code на время импорта или используй режим B (JSON).
 - **Reusable components** разворачиваются inline через `resolveInstances`. Чтобы они стали отдельными Figma-компонентами после импорта, нужно вручную сконвертировать через **Create component** (плагин не делает auto-component, потому что Pencil может ререндерить ref-структуру с разными overrides).
+- **Шрифты зависят от Figma, а не от плагина.** Плагин просит у Figma ровно ту гарнитуру и вес, что стоят в `.pen`. Если их нет — пробует альтернативные написания веса (`SemiBold` → `Semi Bold`), потом тот же шрифт в Regular, потом Inter Regular. **Любая подмена теперь не молчит:** в консоли плагина будет `Unbounded Bold → Inter Regular`, и в Figma появится уведомление. Google-шрифты (Nunito, Unbounded и т.п.) Figma обычно отдаёт сама, кастомные нужно ставить в систему.
+- **`shader` и `mesh_gradient` переносятся картинкой, не вектором.** У Figma нет ни фрагментных шейдеров, ни сетчатых градиентов, поэтому bridge просит Pencil отрендерить такие узлы в PNG и вставляет его заливкой. Выглядит 1:1, но не редактируется. В логе: `[fills] N node(s) use fills Figma can't express`.
+- **`connection` (коннекторы) переносятся пустым контейнером** — у Figma нет аналога в auto-layout.
+- **Material Symbols — только вес 400.** Пакет весит ~90 МБ на вес, поэтому ставится один. `weight` у иконки округляется к ближайшему установленному. Нужен другой — поставь рядом: `npm i @material-symbols/svg-300`, bridge подхватит его автоматически.
+- **`layout: none` + `space_around`** — у Figma нет распределения space-around, оно маппится в `SPACE_BETWEEN` (ближайшее из доступного).
+- **Шрифты** должны быть установлены в Figma. Если семейства нет, плагин пробует альтернативные написания веса (`SemiBold` → `Semi Bold`) и в последнюю очередь падает на Inter Regular.
+- **Большие документы импортируются целиком, но не мгновенно.** Дерево вытягивается пачками по 40 узлов, так что доска на ~6000 узлов — это несколько десятков запросов к Pencil. Прогресс виден в логе bridge (`…expanding <id>: N subtrees`). Если какая-то часть всё же не раскрылась, плагин скажет об этом явно — и в консоли, и уведомлением в Figma.
 
 ---
 
