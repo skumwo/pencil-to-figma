@@ -131,7 +131,10 @@
     display: none;
     line-height: 1.4;
   }
-  .status.error { background: var(--err-bg); color: var(--err-text); }
+  .status.error, .status.err { background: var(--err-bg); color: var(--err-text); }
+  .verify { margin-top: 8px; font-size: 11px; line-height: 1.45; color: var(--fg-muted); display: none; }
+  .verify ul { margin: 4px 0 0; padding-left: 16px; }
+  .verify code { font-size: 10px; word-break: break-all; }
   .status.ok    { background: var(--ok-bg);  color: var(--ok-text); }
   .status.warn  { background: var(--warn-bg); color: var(--warn-text); }
   .meta {
@@ -283,10 +286,24 @@
 <div class="options">
   <div class="options-title">Options</div>
   <label class="opt">
+    <input type="checkbox" id="components" checked />
+    <span>
+      <b>Keep components</b>
+      <span class="opt-desc">Pencil components become Figma components, instances stay linked with their overrides. Off = every instance is expanded into plain layers.</span>
+    </span>
+  </label>
+  <label class="opt">
     <input type="checkbox" id="frameWrap" />
     <span>
       <b>Wrap everything in one frame</b>
       <span class="opt-desc">Put all imported pages inside a single "Pencil Import" container frame. Off = pages dropped directly on the canvas.</span>
+    </span>
+  </label>
+  <label class="opt">
+    <input type="checkbox" id="verify" checked />
+    <span>
+      <b>Check 1:1 against Pencil</b>
+      <span class="opt-desc">After the import, every frame is rendered in Figma and in Pencil and compared. Differences are listed here, with images saved by the bridge.</span>
     </span>
   </label>
   <label class="opt">
@@ -299,6 +316,7 @@
 </div>
 
 <div class="status" id="status"></div>
+<div class="verify" id="verify-result"></div>
 
 <script>
   const BRIDGE_URL = "http://localhost:7777";
@@ -340,6 +358,10 @@
 
   // ─── Tree summary ──────────────────────────────────────────────────────────
   function summarize(t) {
+    // design.json exported with --components: { tree, components }
+    if (t && !Array.isArray(t) && t.type == null && t.tree != null) {
+      t = [].concat(t.tree, t.components || []);
+    }
     let nodes = 0, images = 0, texts = 0;
     function walk(n) {
       if (!n || typeof n !== "object") return;
@@ -356,11 +378,67 @@
   }
 
   function getOpts() {
-    return { frameWrap: $("frameWrap").checked, centerView: $("centerView").checked };
+    return { frameWrap: $("frameWrap").checked, centerView: $("centerView").checked, verify: $("verify").checked };
   }
 
-  function sendImport(tree) {
-    parent.postMessage({ pluginMessage: { type: "import", tree, opts: getOpts() } }, "*");
+  // Bridge session of the current import — the 1:1 check needs it to find Pencil's renders.
+  let session = null;
+  let renders = [];
+
+  function sendImport(tree, components) {
+    renders = [];
+    $("verify-result").style.display = "none";
+    parent.postMessage({ pluginMessage: { type: "import", tree, components, session, opts: getOpts() } }, "*");
+  }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  async function runVerify(issues, diagnostics) {
+    const box = $("verify-result");
+    if (!session || !renders.length) return;
+    const fd = new FormData();
+    fd.append("session", session);
+    fd.append("issues", JSON.stringify(issues || []));
+    fd.append("diagnostics", JSON.stringify(diagnostics || {}));
+    const texts = {};
+    for (const r of renders) {
+      texts[r.id] = r.texts || [];
+      fd.append("render", new Blob([r.bytes], { type: "image/png" }), r.id + ".png");
+    }
+    fd.append("texts", JSON.stringify(texts));
+    showStatus("Comparing " + renders.length + " frame(s) with Pencil…");
+    try {
+      const resp = await fetch(BRIDGE_URL + "/verify", { method: "POST", body: fd });
+      const out = await resp.json();
+      if (!resp.ok) throw new Error(out.error || ("HTTP " + resp.status));
+      const s = out.summary;
+      const bad = out.frames.filter((f) => f.status !== "match");
+      if (!bad.length && !s.issues) {
+        showStatus("1:1 with Pencil — all " + s.frames + " frame(s) match.", "ok");
+        box.style.display = "none";
+      } else {
+        showStatus(
+          s.match + "/" + s.frames + " frame(s) match Pencil" +
+          (bad.length ? ", " + bad.length + " differ" : "") +
+          (s.issues ? ", " + s.issues + " layout mismatch(es)" : "") + ".",
+          "warn"
+        );
+        const what = { differs: "differs", size: "size differs", "pencil-blank": "Pencil rendered it empty", "no-pencil-render": "no Pencil render", error: "not compared" };
+        box.innerHTML =
+          (bad.length ? "<ul>" + bad.map((f) =>
+            "<li><b>" + esc(f.name) + "</b> — " + esc(what[f.status] || f.status) +
+            (f.regions && f.regions.length ? ", " + f.regions.length + " area(s)" : "") +
+            (f.size ? ", frame " + f.size.figma.join("×") + " vs Pencil " + f.size.pencil.join("×") : "") + "</li>").join("") + "</ul>" : "") +
+          (out.issues && out.issues.length ? "<ul>" + out.issues.slice(0, 8).map((i) =>
+            "<li>" + esc(i.frame) + " › " + esc(i.node) + ": " + esc(i.detail) + "</li>").join("") + "</ul>" : "") +
+          "Renders and diffs: <code>" + esc(out.dir) + "</code>";
+        box.style.display = "block";
+      }
+    } catch (e) {
+      showStatus("1:1 check failed: " + (e?.message || e), "err");
+    }
   }
 
   // ─── Pane 1: .pen + folder ────────────────────────────────────────────────
@@ -467,6 +545,7 @@
 
     const fd = new FormData();
     fd.append("pen", penFile, penFile.name);
+    if ($("components").checked) fd.append("components", "1");
     for (const f of imageFiles) {
       const rel = f._relPath || f.webkitRelativePath || f.name;
       fd.append("image", f, rel);
@@ -478,11 +557,16 @@
         const err = await r.json().catch(() => ({}));
         throw new Error(err.error || ("HTTP " + r.status));
       }
-      const { tree, stats } = await r.json();
+      const { tree, components, stats, session: sid } = await r.json();
+      session = sid || null;
+      const docName = stats.document && stats.document.source ? stats.document.source.split("/").pop() : null;
       showStatus(
-        "Bridge → " + stats.embedded + "/" + stats.total + " images embedded. Sending to canvas…"
+        (docName ? docName + ": " : "") +
+        stats.embedded + "/" + stats.total + " images embedded" +
+        (stats.components ? ", " + stats.components.definitions + " components" : "") +
+        ". Sending to canvas…"
       );
-      sendImport(tree);
+      sendImport(tree, components);
     } catch (e) {
       showStatus("Bridge error: " + (e?.message || e), "err");
       importPenBtn.disabled = false;
@@ -534,6 +618,7 @@
     if (!parsedTree) return;
     importJsonBtn.disabled = true;
     showStatus("Importing…");
+    session = null; // no bridge import behind a dropped JSON — nothing to verify against
     sendImport(parsedTree);
   });
   $("clear-json").addEventListener("click", () => {
@@ -548,8 +633,25 @@
   window.addEventListener("message", (e) => {
     const msg = e.data.pluginMessage;
     if (!msg) return;
+    if (msg.type === "render") {
+      renders.push({ id: msg.id, name: msg.name, bytes: msg.bytes, texts: msg.texts });
+      return;
+    }
+    if (msg.type === "renders-done") {
+      runVerify(msg.issues, msg.diagnostics);
+      return;
+    }
     if (msg.type === "done") {
-      showStatus("Imported " + msg.count + " nodes", "ok");
+      const c = msg.components;
+      showStatus(
+        "Imported " + msg.count + " nodes" +
+        (c ? " — " + c.components + " components, " + c.linked + " linked instances" +
+             (c.scaled ? " (" + c.scaled + " scaled)" : "") +
+             (c.detached ? ", " + c.detached + " detached (see console)" : "") : "") +
+        (msg.textFixes ? ", " + msg.textFixes + " text wrap(s) matched to Pencil" : "") +
+        (msg.verifying ? ". Checking 1:1…" : ""),
+        "ok"
+      );
       importPenBtn.disabled = false;
       importJsonBtn.disabled = false;
     } else if (msg.type === "error") {

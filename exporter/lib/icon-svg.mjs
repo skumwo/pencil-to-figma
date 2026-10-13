@@ -91,7 +91,11 @@ function iconDirs(library, weight) {
   const style = MATERIAL_STYLES[lib];
   if (style) {
     const dir = materialDir(style, weight);
-    return dir ? [{ dir, suffix: "" }] : [];
+    // Material Symbols ship every glyph twice: `bolt.svg` (FILL axis 0, an outline)
+    // and `bolt-fill.svg` (FILL 1, solid). Pencil renders the solid one — the
+    // Superhero cover's lightning bolt imported as an outline until this matched —
+    // and the schema has no per-icon fill flag, so the filled file comes first.
+    return dir ? [{ dir, suffix: "-fill" }, { dir, suffix: "" }] : [];
   }
   return [];
 }

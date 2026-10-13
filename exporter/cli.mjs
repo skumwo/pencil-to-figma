@@ -7,8 +7,8 @@
 // What it does:
 //   1. Spawns the Pencil MCP server (auto-discovered, or env PENCIL_MCP_CMD)
 //   2. Opens the document
-//   3. Fetches the COMPLETE design tree via batch_get, expanding every truncated
-//      subtree (see exporter/lib/fetch-tree.mjs)
+//   3. Fetches the COMPLETE design tree (batch_get or execute, whichever this Pencil
+//      build has — see exporter/lib/pencil-api.mjs), expanding any truncated subtree
 //   4. Fetches design variables and resolves all $token refs to concrete values
 //   5. Resolves `icon` nodes to real SVG vectors (PNG fallback via Pencil)
 //   6. Embeds image fills as base64 (reads files from the .pen file's directory)
@@ -25,19 +25,21 @@ import { writeFile } from "node:fs/promises";
 import { resolve, dirname, basename, extname } from "node:path";
 import { existsSync } from "node:fs";
 import { McpClient, findPencilMcp } from "./lib/mcp-client.mjs";
+import { connectPencil, ensureDocumentActive } from "./lib/pencil-api.mjs";
 import { resolveTokens, normalizeVariables } from "./lib/resolve-tokens.mjs";
 import { embedImages } from "./lib/embed-images.mjs";
 import {
-  RESOLVE_OPTS, fetchFullTree, countTreeNodes, resolveIcons, resolveOpenDocument,
+  annotateLineHeights, attachBoxes, fetchComponentTrees, fetchFullTree, countTreeNodes, resolveIcons, resolveOpenDocument,
 } from "./lib/fetch-tree.mjs";
 import { availableLibraries } from "./lib/icon-svg.mjs";
 
 function parseArgs(argv) {
-  const args = { _: [], out: null, node: null };
+  const args = { _: [], out: null, node: null, components: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--out" || a === "-o") args.out = argv[++i];
     else if (a === "--node" || a === "-n") args.node = argv[++i];
+    else if (a === "--components" || a === "-c") args.components = true;
     else if (a === "--help" || a === "-h") args.help = true;
     else args._.push(a);
   }
@@ -53,6 +55,8 @@ Usage:
 Options:
   -o, --out <file>     output path (default: <design>.json next to .pen)
   -n, --node <id>      export only this top-level frame (default: all of them)
+  -c, --components     keep Pencil components: definitions + instances with their
+                       overrides, so the plugin builds real Figma components
   -h, --help
 
 Environment:
@@ -60,8 +64,7 @@ Environment:
                        Pen.app / Pencil.app under /Applications)
   PENCIL_MCP_ARGS      override MCP args (default: "--app desktop")
 
-Note: the Pencil desktop app must be running, and no other MCP client may be
-attached to it (Pencil serves one client at a time).
+Note: the Pencil desktop app must be running with the .pen file open.
 `);
 }
 
@@ -100,31 +103,31 @@ async function main() {
   try {
     await mcp.start();
     log(`[mcp] initialized`);
+    const api = await connectPencil(mcp, log);
 
     // Pencil MCP only exports the document open in its editor, so confirm that's the
     // file we were asked for rather than silently exporting whatever happens to be open.
     const { workingPath } = await resolveOpenDocument(
-      mcp, { name: basename(penPath), path: penPath }, process.env.PEN_ALLOW_MISMATCH === "1", log
+      api, { name: basename(penPath), path: penPath }, process.env.PEN_ALLOW_MISMATCH === "1", log
     );
+
+    if (workingPath) await ensureDocumentActive(api, workingPath, log);
 
     let topLevel = null;
     let lastErr = null;
     for (let retry = 0; retry < 3 && !topLevel; retry++) {
       try {
-        const a = { readDepth: 1, ...RESOLVE_OPTS };
-        if (workingPath) a.filePath = workingPath;
-        const result = await mcp.tool("batch_get", a);
-        const arr = Array.isArray(result) ? result : [result];
+        const arr = await api.topLevel(workingPath);
         if (arr.length && arr[0]) {
           topLevel = arr;
-          log(`[pen] batch_get OK (${arr.length} top-level items)`);
+          log(`[pen] read OK (${arr.length} top-level items)`);
         } else {
-          // Pencil can race the doc-open against the first batch_get.
+          // Pencil can race the doc-open against the first read.
           await new Promise((r) => setTimeout(r, 1500));
         }
       } catch (e) {
         lastErr = e;
-        log(`[pen] batch_get error: ${e.message}`);
+        log(`[pen] read error: ${e.message}`);
         break;
       }
     }
@@ -143,33 +146,44 @@ async function main() {
     if (!rootIds.length) throw new Error("No importable top-level frames found in the .pen file");
     log(`[pen] exporting ${rootIds.length} top-level frame(s): ${rootIds.join(", ")}`);
 
-    log(`[pen] get_variables…`);
-    const variables = normalizeVariables(await mcp.tool("get_variables", {}));
+    log(`[pen] variables…`);
+    const variables = normalizeVariables(await api.getVariables(workingPath));
     log(`[pen] ${Object.keys(variables).length} variables found`);
 
     // Full tree per root, sequentially (Pencil MCP doesn't love parallel calls).
-    const trees = [];
+    let trees = [];
+    let defs = [];
     let incomplete = 0;
-    for (const id of rootIds) {
-      const r = await fetchFullTree(mcp, id, workingPath, log);
-      trees.push(r.tree);
-      incomplete += r.incomplete;
+    if (args.components) {
+      const r = await fetchComponentTrees(api, rootIds, workingPath, log);
+      trees = r.trees;
+      defs = r.components;
+    } else {
+      for (const id of rootIds) {
+        const r = await fetchFullTree(api, id, workingPath, log);
+        trees.push(r.tree);
+        incomplete += r.incomplete;
+      }
     }
 
     log(`[step] resolve tokens…`);
     const resolved = trees.map((t) => resolveTokens(t, variables));
+    const components = defs.map((t) => resolveTokens(t, variables));
+    const all = [...resolved, ...components];
+    try { await attachBoxes(api, all, workingPath, log); } catch (e) { log(`[layout] failed: ${e.message}`); }
+    annotateLineHeights(all, log);
 
     log(`[step] resolve icons…`);
     let icons = null;
     try {
-      icons = await resolveIcons(mcp, resolved, workingPath, log);
+      icons = await resolveIcons(api, all, workingPath, log);
     } catch (e) {
       log(`[icons] processing failed: ${e.message}`);
     }
 
     log(`[step] embed images (reading from ${dirname(penPath)})…`);
     let imgTotal = 0, imgMissing = 0;
-    for (const t of resolved) {
+    for (const t of all) {
       const s = await embedImages(t, dirname(penPath));
       imgTotal += s.total;
       imgMissing += s.missing;
@@ -178,12 +192,17 @@ async function main() {
 
     const nodes = resolved.reduce((s, t) => s + countTreeNodes(t), 0);
     // Single root → emit the object; several → emit the array. The plugin accepts both.
-    await writeFile(outPath, JSON.stringify(resolved.length === 1 ? resolved[0] : resolved, null, 2), "utf8");
+    // With components, wrap both lists: { tree, components }.
+    const payload = args.components
+      ? { tree: resolved, components }
+      : resolved.length === 1 ? resolved[0] : resolved;
+    await writeFile(outPath, JSON.stringify(payload, null, 2), "utf8");
 
     log("");
     log(`[ok] wrote ${outPath}`);
     log(`     frames  : ${resolved.length}`);
     log(`     nodes   : ${nodes}`);
+    if (args.components) log(`     components : ${components.length}`);
     log(`     images  : ${imgTotal - imgMissing}/${imgTotal} embedded`);
     if (icons) log(`     icons   : ${icons.vectors} vectors, ${icons.rasterized} rasterized, of ${icons.total}`);
     if (incomplete) log(`     WARNING : ${incomplete} subtree(s) could not be expanded — the export is incomplete`);

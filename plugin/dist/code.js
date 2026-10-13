@@ -35,6 +35,60 @@
   }
   var fontCache = /* @__PURE__ */ new Set();
   var fontFallbacks = /* @__PURE__ */ new Map();
+  var STYLE_WEIGHTS = {
+    thin: 100,
+    hairline: 100,
+    extralight: 200,
+    ultralight: 200,
+    light: 300,
+    book: 350,
+    regular: 400,
+    normal: 400,
+    medium: 500,
+    semibold: 600,
+    demibold: 600,
+    bold: 700,
+    extrabold: 800,
+    ultrabold: 800,
+    black: 900,
+    heavy: 900,
+    extrablack: 950,
+    ultrablack: 950
+  };
+  function styleWeight(style) {
+    const s = String(style).toLowerCase().replace(/italic|oblique/g, "").replace(/[\s_-]/g, "");
+    return STYLE_WEIGHTS[s] != null ? STYLE_WEIGHTS[s] : 400;
+  }
+  var isItalicStyle = (s) => /italic|oblique/i.test(String(s));
+  var fontIndex = null;
+  async function stylesOf(family) {
+    if (!fontIndex) {
+      fontIndex = /* @__PURE__ */ new Map();
+      try {
+        for (const f of await figma.listAvailableFontsAsync()) {
+          const list = fontIndex.get(f.fontName.family) || [];
+          list.push(f.fontName.style);
+          fontIndex.set(f.fontName.family, list);
+        }
+      } catch (e) {
+        console.warn("[pencil-import] could not list fonts:", (e == null ? void 0 : e.message) || e);
+      }
+    }
+    return fontIndex.get(family) || [];
+  }
+  var axisCache = /* @__PURE__ */ new Map();
+  function variationAxes(family) {
+    if (axisCache.has(family)) return axisCache.get(family);
+    let axes = null;
+    try {
+      const fn = figma.getFontFamilyVariationAxes;
+      if (typeof fn === "function") axes = fn.call(figma, family);
+    } catch (e) {
+      axes = null;
+    }
+    axisCache.set(family, axes);
+    return axes;
+  }
   async function ensureFont(family, style) {
     const key = `${family}|${style}`;
     if (fontCache.has(key)) return { family, style };
@@ -46,17 +100,42 @@
       } catch (e) {
       }
     }
-    try {
-      await figma.loadFontAsync({ family, style: "Regular" });
-      fontCache.add(`${family}|Regular`);
-      fontFallbacks.set(`${family} ${style}`, `${family} Regular`);
-      return { family, style: "Regular" };
-    } catch (e) {
-      await figma.loadFontAsync({ family: "Inter", style: "Regular" });
-      fontCache.add("Inter|Regular");
-      fontFallbacks.set(`${family} ${style}`, "Inter Regular");
-      return { family: "Inter", style: "Regular" };
+    const want = styleWeight(style);
+    const italic = isItalicStyle(style);
+    const available = await stylesOf(family);
+    const axes = available.length ? variationAxes(family) : null;
+    if (axes && axes.indexOf("wght") >= 0) {
+      const base = available.find((s) => isItalicStyle(s) === italic) || available[0];
+      const fontName = { family, style: base, variationSettings: { wght: want } };
+      try {
+        await figma.loadFontAsync(fontName);
+        fontCache.add(`${family}|${base}|${want}`);
+        return fontName;
+      } catch (e) {
+      }
     }
+    if (available.length) {
+      const ranked = available.slice().sort((a, b) => {
+        const ia = isItalicStyle(a) === italic ? 0 : 1e3;
+        const ib = isItalicStyle(b) === italic ? 0 : 1e3;
+        return ia + Math.abs(styleWeight(a) - want) - (ib + Math.abs(styleWeight(b) - want));
+      });
+      for (const candidate of ranked) {
+        try {
+          await figma.loadFontAsync({ family, style: candidate });
+          fontCache.add(`${family}|${candidate}`);
+          if (styleWeight(candidate) !== want || isItalicStyle(candidate) !== italic) {
+            fontFallbacks.set(`${family} ${style}`, `${family} ${candidate} (has: ${available.join(", ")})`);
+          }
+          return { family, style: candidate };
+        } catch (e) {
+        }
+      }
+    }
+    await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+    fontCache.add("Inter|Regular");
+    fontFallbacks.set(`${family} ${style}`, "Inter Regular");
+    return { family: "Inter", style: "Regular" };
   }
   function weightToStyle(weight) {
     if (weight == null) return "Regular";
@@ -321,6 +400,10 @@
       mode = "horizontal";
     }
     frame.layoutMode = mode === "vertical" ? "VERTICAL" : "HORIZONTAL";
+    try {
+      frame.strokesIncludedInLayout = false;
+    } catch (e) {
+    }
     const primaryDim = mode === "vertical" ? node.height : node.width;
     const counterDim = mode === "vertical" ? node.width : node.height;
     const setSizingMode = (which, dim) => {
@@ -444,7 +527,7 @@
       if (type === "shadow" || type === "drop_shadow" || type === "drop-shadow" || type === "inner_shadow" || type === "inner-shadow") {
         const inner = e.shadowType === "inner" || type === "inner_shadow" || type === "inner-shadow";
         const { rgb, a } = parseColor(e.color || "#00000040");
-        list.push({
+        const shadow = {
           type: inner ? "INNER_SHADOW" : "DROP_SHADOW",
           color: __spreadProps(__spreadValues({}, rgb), { a: e.opacity != null ? e.opacity : a }),
           offset: { x: offX, y: offY },
@@ -452,7 +535,8 @@
           spread: e.spread || 0,
           visible: true,
           blendMode: "NORMAL"
-        });
+        };
+        list.push(shadow);
       } else if (type === "blur" || type === "layer_blur") {
         list.push({ type: "LAYER_BLUR", radius: blurRadius, visible: true, blurType: "NORMAL" });
       } else if (type === "background_blur" || type === "background-blur") {
@@ -542,7 +626,7 @@
   }
   function tintIconVectors(frame, tint) {
     const { rgb } = parseColor(tint.hex);
-    const paint = { type: "SOLID", color: rgb, opacity: tint.alpha };
+    const paint = { type: "SOLID", color: rgb, opacity: 1 };
     eachSvgDescendant(frame, (c) => {
       const hasStroke = "strokes" in c && (c.strokes || []).length > 0;
       const hasFill = "fills" in c && Array.isArray(c.fills) && c.fills.length > 0;
@@ -566,6 +650,13 @@
       }
     });
   }
+  function isIconType(node) {
+    return !!node && (node.type === "icon" || node.type === "icon_font");
+  }
+  function iconOpacity(node) {
+    const own = typeof node.opacity === "number" ? node.opacity : 1;
+    return own * iconTint(node.fill).alpha;
+  }
   function vectorFromSvg(svg, w, h) {
     const frame = figma.createNodeFromSvg(svg);
     eachSvgDescendant(frame, (c) => {
@@ -579,9 +670,18 @@
     const wNum = sizingPx(w);
     const hNum = sizingPx(h);
     if (wNum && hNum && wNum > 0 && hNum > 0) {
-      try {
-        frame.resize(wNum, hNum);
-      } catch (e) {
+      const uniform = Math.min(wNum / frame.width, hNum / frame.height);
+      if (Number.isFinite(uniform) && uniform >= 0.01 && Math.abs(uniform - 1) > 1e-3) {
+        try {
+          frame.rescale(uniform);
+        } catch (e) {
+        }
+      }
+      if (Math.abs(frame.width - wNum) > 0.01 || Math.abs(frame.height - hNum) > 0.01) {
+        try {
+          frame.resize(wNum, hNum);
+        } catch (e) {
+        }
       }
     }
     try {
@@ -685,6 +785,75 @@
     }
     return frame;
   }
+  async function applyStrokes(n, node) {
+    if (!("strokes" in n) || node.stroke == null) return;
+    if (n.type === "TEXT") {
+      try {
+        n.strokes = [];
+      } catch (e) {
+      }
+      return;
+    }
+    const sw = strokeWeights(node);
+    if (sw.max <= 0) {
+      try {
+        n.strokes = [];
+      } catch (e) {
+      }
+    } else {
+      const sp = await toPaints(node.stroke);
+      if (sp.length) n.strokes = sp;
+      const align = strokeAlignOf(node);
+      if (align && "strokeAlign" in n) {
+        try {
+          n.strokeAlign = align;
+        } catch (e) {
+        }
+      }
+      if (sw.perSide) {
+        const rn = n;
+        try {
+          rn.strokeWeight = sw.max;
+        } catch (e) {
+        }
+        try {
+          if ("strokeTopWeight" in rn) rn.strokeTopWeight = sw.top;
+        } catch (e) {
+        }
+        try {
+          if ("strokeRightWeight" in rn) rn.strokeRightWeight = sw.right;
+        } catch (e) {
+        }
+        try {
+          if ("strokeBottomWeight" in rn) rn.strokeBottomWeight = sw.bottom;
+        } catch (e) {
+        }
+        try {
+          if ("strokeLeftWeight" in rn) rn.strokeLeftWeight = sw.left;
+        } catch (e) {
+        }
+      } else {
+        try {
+          n.strokeWeight = sw.max;
+        } catch (e) {
+        }
+      }
+    }
+    const capFig = { butt: "NONE", none: "NONE", round: "ROUND", square: "SQUARE" }[node.strokeLinecap];
+    if (capFig && "strokeCap" in n) {
+      try {
+        n.strokeCap = capFig;
+      } catch (e) {
+      }
+    }
+    const joinFig = { miter: "MITER", bevel: "BEVEL", round: "ROUND" }[node.strokeLinejoin];
+    if (joinFig && "strokeJoin" in n) {
+      try {
+        n.strokeJoin = joinFig;
+      } catch (e) {
+      }
+    }
+  }
   async function createNode(node) {
     switch (node.type) {
       case "frame":
@@ -764,6 +933,7 @@
             svg = flipSvg(svg, node.flipX === true, node.flipY === true);
             const frame = vectorFromSvg(svg, node.width, node.height);
             tintIconVectors(frame, tint);
+            frame.opacity = iconOpacity(node);
             return frame;
           } catch (e) {
             console.error(
@@ -795,67 +965,8 @@
       case "note":
       case "prompt":
       case "context": {
-        const family = node.fontFamily || "Inter";
-        let style = weightToStyle(node.fontWeight);
-        if (/^italic$/i.test(String(node.fontStyle || ""))) {
-          style = style === "Regular" ? "Italic" : `${style} Italic`;
-        }
-        const f = await ensureFont(family, style);
         const txt = figma.createText();
-        try {
-          txt.fontName = { family: f.family, style: f.style };
-        } catch (e) {
-          txt.fontName = { family: "Inter", style: "Regular" };
-        }
-        if (node.fontSize != null) txt.fontSize = node.fontSize;
-        txt.characters = String(node.content != null ? node.content : "");
-        if (node.letterSpacing != null) {
-          txt.letterSpacing = { value: node.letterSpacing, unit: "PIXELS" };
-        }
-        if (node.lineHeight != null) {
-          const lh = node.lineHeight;
-          if (lh > 0 && lh < 5) {
-            txt.lineHeight = { value: lh * 100, unit: "PERCENT" };
-          } else {
-            txt.lineHeight = { value: lh, unit: "PIXELS" };
-          }
-        }
-        const ta = {
-          left: "LEFT",
-          center: "CENTER",
-          right: "RIGHT",
-          justified: "JUSTIFIED",
-          justify: "JUSTIFIED"
-        };
-        if (node.textAlign && ta[node.textAlign]) txt.textAlignHorizontal = ta[node.textAlign];
-        const tav = {
-          top: "TOP",
-          center: "CENTER",
-          middle: "CENTER",
-          bottom: "BOTTOM"
-        };
-        if (node.textAlignVertical && tav[node.textAlignVertical]) txt.textAlignVertical = tav[node.textAlignVertical];
-        const tc = {
-          none: "ORIGINAL",
-          original: "ORIGINAL",
-          upper: "UPPER",
-          uppercase: "UPPER",
-          lower: "LOWER",
-          lowercase: "LOWER",
-          title: "TITLE"
-        };
-        if (node.textCase && tc[node.textCase]) txt.textCase = tc[node.textCase];
-        const td = {
-          none: "NONE",
-          underline: "UNDERLINE",
-          strikethrough: "STRIKETHROUGH",
-          "line-through": "STRIKETHROUGH"
-        };
-        if (node.underline === true) txt.textDecoration = "UNDERLINE";
-        else if (node.strikethrough === true) txt.textDecoration = "STRIKETHROUGH";
-        else if (node.textDecoration && td[node.textDecoration]) txt.textDecoration = td[node.textDecoration];
-        const paints = await toPaints(node.fill);
-        if (paints.length) txt.fills = paints;
+        await applyTextProps(txt, node);
         return txt;
       }
       default:
@@ -867,6 +978,70 @@
         );
         return figma.createFrame();
     }
+  }
+  async function applyTextProps(txt, node) {
+    const family = node.fontFamily || "Inter";
+    let style = weightToStyle(node.fontWeight);
+    if (/^italic$/i.test(String(node.fontStyle || ""))) {
+      style = style === "Regular" ? "Italic" : `${style} Italic`;
+    }
+    const f = await ensureFont(family, style);
+    try {
+      txt.fontName = f.variationSettings ? f : { family: f.family, style: f.style };
+    } catch (e) {
+      txt.fontName = { family: "Inter", style: "Regular" };
+    }
+    if (node.fontSize != null) txt.fontSize = node.fontSize;
+    txt.characters = String(node.content != null ? node.content : "");
+    if (node.letterSpacing != null) {
+      txt.letterSpacing = { value: node.letterSpacing, unit: "PIXELS" };
+    }
+    if (typeof node._lineHeightPx === "number" && node._lineHeightPx > 0) {
+      txt.lineHeight = { value: node._lineHeightPx, unit: "PIXELS" };
+    } else if (node.lineHeight != null) {
+      const lh = node.lineHeight;
+      if (lh > 0 && lh < 5) {
+        txt.lineHeight = { value: lh * 100, unit: "PERCENT" };
+      } else {
+        txt.lineHeight = { value: lh, unit: "PIXELS" };
+      }
+    }
+    const ta = {
+      left: "LEFT",
+      center: "CENTER",
+      right: "RIGHT",
+      justified: "JUSTIFIED",
+      justify: "JUSTIFIED"
+    };
+    if (node.textAlign && ta[node.textAlign]) txt.textAlignHorizontal = ta[node.textAlign];
+    const tav = {
+      top: "TOP",
+      center: "CENTER",
+      middle: "CENTER",
+      bottom: "BOTTOM"
+    };
+    if (node.textAlignVertical && tav[node.textAlignVertical]) txt.textAlignVertical = tav[node.textAlignVertical];
+    const tc = {
+      none: "ORIGINAL",
+      original: "ORIGINAL",
+      upper: "UPPER",
+      uppercase: "UPPER",
+      lower: "LOWER",
+      lowercase: "LOWER",
+      title: "TITLE"
+    };
+    if (node.textCase && tc[node.textCase]) txt.textCase = tc[node.textCase];
+    const td = {
+      none: "NONE",
+      underline: "UNDERLINE",
+      strikethrough: "STRIKETHROUGH",
+      "line-through": "STRIKETHROUGH"
+    };
+    if (node.underline === true) txt.textDecoration = "UNDERLINE";
+    else if (node.strikethrough === true) txt.textDecoration = "STRIKETHROUGH";
+    else if (node.textDecoration && td[node.textDecoration]) txt.textDecoration = td[node.textDecoration];
+    const paints = await toPaints(node.fill);
+    if (paints.length) txt.fills = paints;
   }
   var truncatedNodes = [];
   function fitFrameToChildren(frame) {
@@ -916,8 +1091,11 @@
     }
   }
   async function build(node, parent) {
+    if (node.type === "ref") return buildInstance(node, parent);
+    if (node.reusable === true && nestedPending.has(String(node.id))) return placeNestedDefinition(node, parent);
     const n = await createNode(node);
     parent.appendChild(n);
+    builtPairs.push({ node, fig: n });
     if (node.name) n.name = String(node.name);
     if (node.enabled === false || node.visible === false) n.visible = false;
     if (node.layoutPosition === "absolute" && "layoutPositioning" in n) {
@@ -968,74 +1146,21 @@
         n.fills = [];
       }
     }
-    if ("strokes" in n && node.stroke != null && !isPathVector) {
-      const sw = strokeWeights(node);
-      if (sw.max <= 0) {
-        try {
-          n.strokes = [];
-        } catch (e) {
-        }
-      } else {
-        const sp = await toPaints(node.stroke);
-        if (sp.length) n.strokes = sp;
-        const align = strokeAlignOf(node);
-        if (align && "strokeAlign" in n) {
-          try {
-            n.strokeAlign = align;
-          } catch (e) {
-          }
-        }
-        if (sw.perSide) {
-          const rn = n;
-          try {
-            rn.strokeWeight = sw.max;
-          } catch (e) {
-          }
-          try {
-            if ("strokeTopWeight" in rn) rn.strokeTopWeight = sw.top;
-          } catch (e) {
-          }
-          try {
-            if ("strokeRightWeight" in rn) rn.strokeRightWeight = sw.right;
-          } catch (e) {
-          }
-          try {
-            if ("strokeBottomWeight" in rn) rn.strokeBottomWeight = sw.bottom;
-          } catch (e) {
-          }
-          try {
-            if ("strokeLeftWeight" in rn) rn.strokeLeftWeight = sw.left;
-          } catch (e) {
-          }
-        } else {
-          try {
-            n.strokeWeight = sw.max;
-          } catch (e) {
-          }
-        }
-      }
-      const capFig = { butt: "NONE", none: "NONE", round: "ROUND", square: "SQUARE" }[node.strokeLinecap];
-      if (capFig && "strokeCap" in n) {
-        try {
-          n.strokeCap = capFig;
-        } catch (e) {
-        }
-      }
-      const joinFig = { miter: "MITER", bevel: "BEVEL", round: "ROUND" }[node.strokeLinejoin];
-      if (joinFig && "strokeJoin" in n) {
-        try {
-          n.strokeJoin = joinFig;
-        } catch (e) {
-        }
-      }
-    }
+    if (!isPathVector) await applyStrokes(n, node);
     if (node.cornerRadius != null) applyCornerRadius(n, node.cornerRadius);
-    if (node.opacity != null && "opacity" in n) n.opacity = node.opacity;
+    if (node.opacity != null && "opacity" in n) {
+      n.opacity = isIconType(node) && n.type === "FRAME" ? iconOpacity(node) : node.opacity;
+    }
     if (node.blendMode && blendMap[node.blendMode] && "blendMode" in n) {
       n.blendMode = blendMap[node.blendMode];
     }
     if (node.effect != null) applyEffects(n, node.effect);
     else if (node.effects != null) applyEffects(n, node.effects);
+    if (isPathVector && "effects" in n && n.effects.some((e) => e.type === "DROP_SHADOW")) {
+      const fillPaints = await toPaints(node.fill);
+      const filled = fillPaints.some((p) => p.visible !== false && (p.opacity == null || p.opacity > 1e-3));
+      if (!filled) n.effects = n.effects.filter((e) => e.type !== "DROP_SHADOW");
+    }
     if (n.type === "FRAME") {
       n.clipsContent = node.type === "group" ? false : node.clip === true;
       if (node.type !== "group") applyAutoLayout(n, node);
@@ -1053,22 +1178,953 @@
     }
     if (node.type === "group" && n.type === "FRAME") fitFrameToChildren(n);
     applyChildSizing(n, node);
+    if (node.rotation && "rotation" in n) {
+      if (node.x != null) n.x = node.x;
+      if (node.y != null) n.y = node.y;
+    }
+    alignToPencilBox(n, node, parent);
+    hideShadowUnderFill(n);
+    emulateBoxShadow(n, node);
     return n;
+  }
+  var components = /* @__PURE__ */ new Map();
+  var wrappedMains = /* @__PURE__ */ new Set();
+  var nestedPending = /* @__PURE__ */ new Set();
+  var buildingComponents = false;
+  var instanceStats = { linked: 0, scaled: 0, detached: 0, reasons: /* @__PURE__ */ new Map() };
+  var OV_IGNORE = /* @__PURE__ */ new Set(["id", "name", "context", "metadata"]);
+  var OV_TEXT = /* @__PURE__ */ new Set([
+    "content",
+    "fontFamily",
+    "fontSize",
+    "fontWeight",
+    "fontStyle",
+    "letterSpacing",
+    "lineHeight",
+    "textAlign",
+    "textAlignVertical",
+    "textCase",
+    "underline",
+    "strikethrough",
+    "textDecoration",
+    "textGrowth"
+  ]);
+  var OV_STROKE = /* @__PURE__ */ new Set(["stroke", "strokeWidth", "strokeAlignment", "strokeLinecap", "strokeLinejoin"]);
+  var OV_LAYOUT = /* @__PURE__ */ new Set(["layout", "gap", "padding", "justifyContent", "alignItems"]);
+  var OV_GEOMETRY = /* @__PURE__ */ new Set(["x", "y", "width", "height", "rotation", "layoutPosition"]);
+  var OV_PAINT = /* @__PURE__ */ new Set(["enabled", "visible", "opacity", "blendMode", "fill", "cornerRadius", "effect", "effects", "clip"]);
+  var REF_OWN_SKIP = /* @__PURE__ */ new Set(["id", "type", "ref", "name", "descendants", "_resolved"]);
+  function overrideProblem(ov) {
+    if (!ov || typeof ov !== "object") return "malformed override";
+    for (const k of Object.keys(ov)) {
+      if (k.startsWith("_")) continue;
+      if (OV_IGNORE.has(k) || OV_TEXT.has(k) || OV_STROKE.has(k) || OV_LAYOUT.has(k) || OV_GEOMETRY.has(k) || OV_PAINT.has(k)) continue;
+      if (k === "descendants") {
+        for (const v of Object.values(ov.descendants || {})) {
+          const p = overrideProblem(v);
+          if (p) return p;
+        }
+        continue;
+      }
+      if (k === "type" || k === "children") return "a layer is replaced inside the instance";
+      return `"${k}" is overridden (no Figma instance equivalent)`;
+    }
+    return null;
+  }
+  function instanceProblem(node) {
+    const own = {};
+    for (const k of Object.keys(node)) if (!REF_OWN_SKIP.has(k) && !k.startsWith("_")) own[k] = node[k];
+    return overrideProblem(own) || overrideProblem({ descendants: node.descendants || {} });
+  }
+  function noteDetached(node, reason) {
+    instanceStats.detached++;
+    instanceStats.reasons.set(reason, (instanceStats.reasons.get(reason) || 0) + 1);
+    console.warn(`[pencil-import] "${node.name || node.id}" (instance of ${node.ref}) built detached: ${reason}`);
+  }
+  function indexResolved(root) {
+    const map = /* @__PURE__ */ new Map();
+    (function walk(n, path) {
+      if (!n || typeof n !== "object") return;
+      if (n.id != null) map.set(String(n.id), { node: n, path });
+      if (Array.isArray(n.children)) n.children.forEach((c, i) => walk(c, [...path, i]));
+    })(root, []);
+    return map;
+  }
+  async function unwrapLayer(n) {
+    if (n.type !== "INSTANCE" || !wrappedMains.size) return n;
+    const main = await n.getMainComponentAsync();
+    const inst = n;
+    return main && wrappedMains.has(main.id) && inst.children.length ? inst.children[0] : n;
+  }
+  async function layerAt(root, path) {
+    let t = root;
+    for (const i of path) {
+      if (!("children" in t)) return null;
+      const kids = t.children;
+      if (i < 0 || i >= kids.length) return null;
+      t = await unwrapLayer(kids[i]);
+    }
+    return t;
+  }
+  var OverrideRefused = class extends Error {
+  };
+  function expectNear(what, prop, actual, want) {
+    if (typeof want !== "number" || !Number.isFinite(want)) return;
+    if (Math.abs(actual - want) > 0.5) {
+      console.warn(`[pencil-import] Figma kept ${prop}=${Math.round(actual * 100) / 100} on ${what}, Pencil has ${want}`);
+      throw new OverrideRefused(`Figma won't override "${prop}" of a layer inside an instance`);
+    }
+  }
+  async function applyFillOverride(target, merged) {
+    const t = merged.type;
+    if (t === "icon" || t === "icon_font") {
+      tintIconVectors(target, iconTint(merged.fill));
+      if ("opacity" in target) target.opacity = iconOpacity(merged);
+      return;
+    }
+    const paints = await toPaints(merged.fill);
+    if (t === "path" || t === "vector") {
+      eachSvgDescendant(target, (c) => {
+        if (c.type === "VECTOR") c.fills = paints;
+      });
+      return;
+    }
+    if ("fills" in target) target.fills = paints;
+  }
+  async function applyPathStrokeOverride(target, merged) {
+    const th = strokeWeights(merged).max;
+    const paints = th > 0 ? await toPaints(merged.stroke) : [];
+    eachSvgDescendant(target, (c) => {
+      if (c.type !== "VECTOR") return;
+      const v = c;
+      v.strokes = paints;
+      if (th > 0) v.strokeWeight = th;
+    });
+  }
+  function applyLayoutOverride(f, merged, keys, what) {
+    if (keys.includes("layout")) {
+      const want = merged.layout === "vertical" ? "VERTICAL" : merged.layout === "none" ? "NONE" : "HORIZONTAL";
+      if (f.layoutMode !== want) {
+        f.layoutMode = want;
+        if (f.layoutMode !== want) throw new OverrideRefused(`Figma won't change auto-layout direction inside an instance`);
+      }
+    }
+    if (keys.includes("gap") && typeof merged.gap === "number") {
+      f.itemSpacing = merged.gap;
+      expectNear(what, "gap", f.itemSpacing, merged.gap);
+    }
+    if (keys.includes("padding")) {
+      const p = expandPadding(merged.padding);
+      f.paddingTop = p.top;
+      f.paddingRight = p.right;
+      f.paddingBottom = p.bottom;
+      f.paddingLeft = p.left;
+      expectNear(what, "padding", f.paddingTop, p.top);
+      expectNear(what, "padding", f.paddingLeft, p.left);
+    }
+    if (keys.includes("justifyContent") && alignMap[merged.justifyContent]) {
+      f.primaryAxisAlignItems = alignMap[merged.justifyContent];
+    }
+    if (keys.includes("alignItems") && alignMap[merged.alignItems] && alignMap[merged.alignItems] !== "SPACE_BETWEEN") {
+      f.counterAxisAlignItems = alignMap[merged.alignItems];
+    }
+  }
+  async function applyOverride(target, merged, ov, what) {
+    const keys = Object.keys(ov).filter((k) => !OV_IGNORE.has(k) && k !== "descendants" && !k.startsWith("_"));
+    const has = (set) => keys.some((k) => set.has(k));
+    const t = merged.type;
+    const isText = t === "text" || t === "note" || t === "prompt" || t === "context";
+    if (keys.includes("enabled") || keys.includes("visible")) {
+      target.visible = !(merged.enabled === false || merged.visible === false);
+    }
+    if (keys.includes("opacity") && "opacity" in target) {
+      target.opacity = isIconType(merged) ? iconOpacity(merged) : merged.opacity != null ? merged.opacity : 1;
+    }
+    if (keys.includes("blendMode") && merged.blendMode && blendMap[merged.blendMode] && "blendMode" in target) {
+      target.blendMode = blendMap[merged.blendMode];
+    }
+    if (isText && (has(OV_TEXT) || keys.includes("fill"))) {
+      if (target.type !== "TEXT") throw new Error(`text override landed on a ${target.type}`);
+      await applyTextProps(target, merged);
+    } else if (keys.includes("fill")) {
+      await applyFillOverride(target, merged);
+    }
+    if (has(OV_STROKE)) {
+      if (t === "path" || t === "vector") await applyPathStrokeOverride(target, merged);
+      else await applyStrokes(target, merged);
+    }
+    if (keys.includes("cornerRadius")) applyCornerRadius(target, merged.cornerRadius);
+    if (keys.includes("effect") || keys.includes("effects")) {
+      applyEffects(target, merged.effect != null ? merged.effect : merged.effects != null ? merged.effects : []);
+    }
+    if (keys.includes("clip") && "clipsContent" in target) target.clipsContent = merged.clip === true;
+    if (has(OV_LAYOUT)) {
+      if (!("itemSpacing" in target)) throw new Error(`layout override landed on a ${target.type}`);
+      applyLayoutOverride(target, merged, keys, what);
+    }
+  }
+  async function applyGeometryOverride(target, merged, keys, what, scaled = false) {
+    if (scaled) {
+      checkLayerGeometry(target, merged, what, keys.includes("x") || keys.includes("y"));
+      return;
+    }
+    if (keys.includes("layoutPosition") && "layoutPositioning" in target) {
+      target.layoutPositioning = merged.layoutPosition === "absolute" ? "ABSOLUTE" : "AUTO";
+    }
+    if (keys.includes("width") || keys.includes("height")) {
+      const t = merged.type;
+      const wNum = sizingMode(merged.width) === "FIXED" ? sizingPx(merged.width) : null;
+      const hNum = sizingMode(merged.height) === "FIXED" ? sizingPx(merged.height) : null;
+      if ((t === "icon" || t === "icon_font") && wNum && hNum && "rescale" in target) {
+        const k = Math.min(wNum / target.width, hNum / target.height);
+        if (Number.isFinite(k) && k >= 0.01 && Math.abs(k - 1) > 1e-3) target.rescale(k);
+      } else {
+        applyChildSizing(target, merged);
+      }
+      const isText = target.type === "TEXT";
+      const growth = isText ? textAutoResizeFor(merged) : null;
+      if (!isText || growth !== "WIDTH_AND_HEIGHT") expectNear(what, "width", target.width, wNum);
+      if (!isText || growth === "NONE") expectNear(what, "height", target.height, hNum);
+    }
+    if (keys.includes("x") && typeof merged.x === "number") {
+      target.x = merged.x;
+      expectNear(what, "x", target.x, merged.x);
+    }
+    if (keys.includes("y") && typeof merged.y === "number") {
+      target.y = merged.y;
+      expectNear(what, "y", target.y, merged.y);
+    }
+    if (keys.includes("rotation") && typeof merged.rotation === "number" && "rotation" in target) {
+      target.rotation = merged.rotation;
+    }
+  }
+  async function applyDescendantOverrides(root, index, refId, descendants, prefix, later, scaled = false) {
+    for (const [key, ov] of Object.entries(descendants || {})) {
+      const full = prefix + key;
+      const hit = index.get(`${refId}/${full}`);
+      if (!hit) throw new Error(`override target "${full}" is not in the resolved instance`);
+      const layer = await layerAt(root, hit.path);
+      if (!layer) throw new Error(`no Figma layer at the path of "${full}"`);
+      const what = `"${hit.node.name || full}"`;
+      await applyOverride(layer, hit.node, ov, what);
+      const g = Object.keys(ov).filter((k) => OV_GEOMETRY.has(k));
+      if (g.length) later.push(() => applyGeometryOverride(layer, hit.node, g, what, scaled));
+      if (ov.descendants) {
+        await applyDescendantOverrides(root, index, refId, ov.descendants, full + "/", later, scaled);
+      }
+    }
+  }
+  async function applyInstance(inst, entry, node, scaled = false) {
+    const resolved = node._resolved;
+    if (!resolved || typeof resolved !== "object") throw new Error("the bridge sent no resolved copy of this instance");
+    const index = indexResolved(resolved);
+    const root = entry.wrapped && inst.children.length ? inst.children[0] : inst;
+    if (node.name) inst.name = String(node.name);
+    if (node.layoutPosition === "absolute") {
+      try {
+        inst.layoutPositioning = "ABSOLUTE";
+      } catch (e) {
+      }
+    }
+    const later = [];
+    await applyDescendantOverrides(root, index, String(node.id), node.descendants, "", later, scaled);
+    const own = {};
+    for (const k of Object.keys(node)) {
+      if (!REF_OWN_SKIP.has(k) && !OV_GEOMETRY.has(k) && !k.startsWith("_")) own[k] = node[k];
+    }
+    await applyOverride(root, resolved, own, `"${node.name || node.id}"`);
+    for (const g of later) await g();
+    applyChildSizing(inst, resolved);
+    if (node.rotation) inst.rotation = node.rotation;
+    if (node.x != null) inst.x = node.x;
+    if (node.y != null) inst.y = node.y;
+    if (inst.parent) alignToPencilBox(inst, resolved, inst.parent);
+  }
+  async function buildDetached(node, parent, reason) {
+    noteDetached(node, reason);
+    if (node._resolved && typeof node._resolved === "object") return build(node._resolved, parent);
+    const f = figma.createFrame();
+    parent.appendChild(f);
+    f.name = String(node.name || node.id || "instance");
+    f.fills = [];
+    return f;
+  }
+  async function buildInstance(node, parent) {
+    const entry = components.get(String(node.ref));
+    if (!entry) return buildDetached(node, parent, "its component was not exported");
+    const problem = instanceProblem(node);
+    if (problem) return buildDetached(node, parent, problem);
+    const inst = entry.component.createInstance();
+    parent.appendChild(inst);
+    try {
+      await applyInstance(inst, entry, node);
+      instanceStats.linked++;
+      await recordInstancePairs(inst, entry, node._resolved);
+      return inst;
+    } catch (e) {
+      try {
+        inst.remove();
+      } catch (e2) {
+      }
+      if (e instanceof OverrideRefused) {
+        const scaled = await buildScaledInstance(entry, node, parent);
+        if (scaled) {
+          instanceStats.linked++;
+          instanceStats.scaled++;
+          await recordInstancePairs(scaled, entry, node._resolved);
+          return scaled;
+        }
+      }
+      const reason = e instanceof OverrideRefused ? e.message : `override failed (${(e == null ? void 0 : e.message) || e})`;
+      return buildDetached(node, parent, reason);
+    }
+  }
+  async function buildScaledInstance(entry, node, parent) {
+    const resolved = node._resolved;
+    if (!resolved || typeof resolved !== "object") return null;
+    const index = indexResolved(resolved);
+    const refId = String(node.id);
+    const inst = entry.component.createInstance();
+    parent.appendChild(inst);
+    const root = entry.wrapped && inst.children.length ? inst.children[0] : inst;
+    try {
+      const ratios = [];
+      const collect = async (desc, prefix) => {
+        for (const [key, ov] of Object.entries(desc || {})) {
+          const o = ov;
+          const full = prefix + key;
+          const hit = index.get(`${refId}/${full}`);
+          if (hit && (o.width !== void 0 || o.height !== void 0)) {
+            const layer = await layerAt(root, hit.path);
+            const w = sizingMode(hit.node.width) === "FIXED" ? sizingPx(hit.node.width) : null;
+            const h = sizingMode(hit.node.height) === "FIXED" ? sizingPx(hit.node.height) : null;
+            if (layer && w && layer.width > 0) ratios.push(w / layer.width);
+            if (layer && h && layer.height > 0) ratios.push(h / layer.height);
+          }
+          if (o.descendants) await collect(o.descendants, full + "/");
+        }
+      };
+      await collect(node.descendants, "");
+      if (!ratios.length) throw new Error("no resized layer to infer a scale from");
+      ratios.sort((a, b) => a - b);
+      const k = ratios[Math.floor(ratios.length / 2)];
+      if (!(k >= 0.01) || ratios.some((r) => Math.abs(r / k - 1) > 0.01)) {
+        throw new Error("the resized layers don't share one scale");
+      }
+      inst.rescale(k);
+      await restoreAfterScale(root, resolved);
+      await applyInstance(inst, entry, node, true);
+      await verifyScaledGeometry(root, resolved, null);
+      return inst;
+    } catch (e) {
+      console.warn(`[pencil-import] "${node.name || node.id}": scaling the instance didn't reproduce Pencil (${(e == null ? void 0 : e.message) || e})`);
+      try {
+        inst.remove();
+      } catch (e2) {
+      }
+      return null;
+    }
+  }
+  async function restoreAfterScale(layer, n) {
+    const t = n.type;
+    if (t === "text" || t === "note" || t === "prompt" || t === "context") {
+      if (layer.type === "TEXT") await applyTextProps(layer, n);
+    } else if (t === "path" || t === "vector") {
+      if (n.stroke != null) await applyPathStrokeOverride(layer, n);
+    } else if (!isIconType(n)) {
+      if ("itemSpacing" in layer && layer.layoutMode !== "NONE") {
+        const f = layer;
+        f.itemSpacing = typeof n.gap === "number" ? n.gap : 0;
+        const p = expandPadding(n.padding);
+        f.paddingTop = p.top;
+        f.paddingRight = p.right;
+        f.paddingBottom = p.bottom;
+        f.paddingLeft = p.left;
+      }
+      if (n.stroke != null) await applyStrokes(layer, n);
+      if ("cornerRadius" in layer) applyCornerRadius(layer, n.cornerRadius != null ? n.cornerRadius : 0);
+      const fx = n.effect != null ? n.effect : n.effects;
+      if ("effects" in layer && (fx != null || layer.effects.length)) applyEffects(layer, fx != null ? fx : []);
+    }
+    if (Array.isArray(n.children) && "children" in layer) {
+      const kids = layer.children;
+      for (let i = 0; i < n.children.length && i < kids.length; i++) {
+        await restoreAfterScale(await unwrapLayer(kids[i]), n.children[i]);
+      }
+    }
+  }
+  function checkLayerGeometry(layer, n, what, position) {
+    const isText = layer.type === "TEXT";
+    const growth = isText ? textAutoResizeFor(n) : null;
+    const w = sizingMode(n.width) === "FIXED" ? sizingPx(n.width) : null;
+    const h = sizingMode(n.height) === "FIXED" ? sizingPx(n.height) : null;
+    if (w != null && (!isText || growth !== "WIDTH_AND_HEIGHT")) expectNear(what, "width", layer.width, w);
+    if (h != null && (!isText || growth === "NONE")) expectNear(what, "height", layer.height, h);
+    if (position) {
+      if (typeof n.x === "number") expectNear(what, "x", layer.x, n.x);
+      if (typeof n.y === "number") expectNear(what, "y", layer.y, n.y);
+    }
+  }
+  async function verifyScaledGeometry(layer, n, parentLayout) {
+    const absolute = parentLayout !== null && (n.layoutPosition === "absolute" || parentLayout === "none");
+    checkLayerGeometry(layer, n, `"${n.name || n.id}"`, absolute);
+    if (Array.isArray(n.children) && "children" in layer) {
+      const kids = layer.children;
+      const lay = n.layout === "vertical" || n.layout === "horizontal" || n.layout === "none" ? n.layout : "horizontal";
+      for (let i = 0; i < n.children.length && i < kids.length; i++) {
+        await verifyScaledGeometry(await unwrapLayer(kids[i]), n.children[i], lay);
+      }
+    }
+  }
+  var builtPairs = [];
+  var pencilOf = /* @__PURE__ */ new Map();
+  var layoutIssues = [];
+  var textFixes = 0;
+  var trackingShifts = 0;
+  var MAX_ISSUES = 300;
+  function noteIssue(frame, node, kind, detail) {
+    if (layoutIssues.length >= MAX_ISSUES) return;
+    layoutIssues.push({ frame, node: String(node.name || node.id), kind, detail });
+  }
+  async function recordInstancePairs(inst, entry, resolved) {
+    if (!resolved || typeof resolved !== "object") return;
+    const root = entry.wrapped && inst.children.length ? inst.children[0] : inst;
+    const walk = async (n, f) => {
+      builtPairs.push({ node: n, fig: f });
+      if (!Array.isArray(n.children) || !("children" in f)) return;
+      const kids = f.children;
+      for (let i = 0; i < n.children.length && i < kids.length; i++) await walk(n.children[i], await unwrapLayer(kids[i]));
+    };
+    await walk(resolved, root);
+  }
+  function isRendered(n) {
+    let cur = n;
+    while (cur && cur.type !== "PAGE") {
+      if ("visible" in cur && !cur.visible) return false;
+      cur = cur.parent;
+    }
+    return true;
+  }
+  function textLineHeightPx(t) {
+    const fs = typeof t.fontSize === "number" ? t.fontSize : 16;
+    const lh = t.lineHeight;
+    if (lh === figma.mixed || !lh) return fs * 1.2;
+    if (lh.unit === "PIXELS") return lh.value;
+    if (lh.unit === "PERCENT") return lh.value / 100 * fs;
+    return fs * 1.2;
+  }
+  function letterSpacingPx(t) {
+    const ls = t.letterSpacing;
+    if (ls === figma.mixed) return null;
+    const fs = typeof t.fontSize === "number" ? t.fontSize : 16;
+    return ls.unit === "PIXELS" ? ls.value : ls.value / 100 * fs;
+  }
+  function matchAutoWidth(frame, node, t) {
+    const box = node._box;
+    if (!Array.isArray(box) || !isRendered(t)) return;
+    const pw = box[2];
+    const n = t.characters.length;
+    const base = letterSpacingPx(t);
+    if (base == null || n < 1 || !(pw > 0)) return;
+    const w0 = t.width;
+    const diff = pw - w0;
+    if (Math.abs(diff) <= 0.15) return;
+    if (n === 1 && Math.abs(base) > 0.01 && Math.abs(diff - base) <= 0.6) {
+      try {
+        const h = t.height;
+        t.textAutoResize = "NONE";
+        t.resize(pw, h);
+      } catch (e) {
+      }
+      return;
+    }
+    if (Math.abs(diff) > pw * 0.03 && Math.abs(diff) > 1.5) {
+      noteIssue(
+        frame,
+        node,
+        "text-width",
+        `${Math.round(w0)}px wide in Figma, ${Math.round(pw)}px in Pencil \u2014 more than glyph drift, check the font`
+      );
+      return;
+    }
+    if (n < 2) return;
+    let ls = base + diff / n;
+    const limit = Math.abs(base) + pw * 0.03 / n;
+    for (let i = 0; i < 6; i++) {
+      t.letterSpacing = { value: +ls.toFixed(3), unit: "PIXELS" };
+      const rest = pw - t.width;
+      if (Math.abs(rest) <= (Number.isInteger(t.width) ? 0.51 : 0.3)) return;
+      const next = ls + rest / Math.max(1, n - 1);
+      if (Math.abs(next) > limit) break;
+      ls = next;
+    }
+    if (Math.abs(pw - t.width) > Math.abs(diff)) t.letterSpacing = { value: base, unit: "PIXELS" };
+  }
+  function matchCenteredTracking(node, t) {
+    if (t.textAlignHorizontal !== "CENTER" || t.textAutoResize === "WIDTH_AND_HEIGHT") return;
+    const ls = Number(node.letterSpacing) || 0;
+    if (Math.abs(ls) < 0.25 || t.letterSpacing === figma.mixed) return;
+    const parent = t.parent;
+    const inFlow = !!parent && "layoutMode" in parent && parent.layoutMode !== "NONE" && t.layoutPositioning !== "ABSOLUTE";
+    if (inFlow) return;
+    const m = t.relativeTransform;
+    t.relativeTransform = [
+      [m[0][0], m[0][1], m[0][2] - ls * m[0][0]],
+      [m[1][0], m[1][1], m[1][2] - ls * m[1][0]]
+    ];
+    trackingShifts++;
+  }
+  async function matchLineBreaks(frame, node, t) {
+    const box = node._box;
+    if (!Array.isArray(box) || !isRendered(t)) return;
+    const text = t.characters;
+    if (!/\S\s+\S/.test(text)) return;
+    const [, , pw, ph] = box;
+    const lh = textLineHeightPx(t);
+    if (ph < lh * 1.5 && t.height < lh * 1.5) return;
+    const W = t.width;
+    if (Math.abs(W - pw) > 1) return;
+    const base = letterSpacingPx(t);
+    if (base == null) return;
+    let probe = null;
+    try {
+      probe = t.clone();
+      probe.x = -1e5;
+      probe.y = -1e5;
+      probe.textAutoResize = "WIDTH_AND_HEIGHT";
+      const p = probe;
+      const measure = (str) => {
+        p.characters = str;
+        return p.width;
+      };
+      const spaceAdvance = measure("x x") - measure("xx");
+      const breaks = [];
+      let offset = 0;
+      for (const para of text.split("\n")) {
+        const words = [];
+        const re = /\S+/g;
+        let m;
+        while (m = re.exec(para)) words.push({ s: m.index, e: m.index + m[0].length });
+        let i = 0;
+        while (i < words.length) {
+          let j = i;
+          while (j + 1 < words.length && measure(para.slice(words[i].s, words[j + 1].e)) <= W + 0.01) j++;
+          if (j + 1 < words.length && measure(para.slice(words[i].s, words[j + 1].s)) > W + 0.01) {
+            breaks.push([offset + words[j].e, offset + words[j + 1].s]);
+          }
+          i = j + 1;
+        }
+        offset += para.length + 1;
+      }
+      if (!breaks.length) return;
+      const zero = { value: +(base - spaceAdvance).toFixed(3), unit: "PIXELS" };
+      for (const [a, b] of breaks) t.setRangeLetterSpacing(a, b, zero);
+      textFixes++;
+    } catch (e) {
+      console.warn(`[pencil-import] line-break check failed for "${node.name || node.id}":`, (e == null ? void 0 : e.message) || e);
+    } finally {
+      try {
+        probe == null ? void 0 : probe.remove();
+      } catch (e) {
+      }
+    }
+  }
+  async function fixTextLines(frame, node, t) {
+    const box = node._box;
+    if (!Array.isArray(box) || t.removed || !isRendered(t)) return;
+    const [, , pw, ph] = box;
+    const lh = textLineHeightPx(t);
+    if (Math.abs(t.height - ph) < lh * 0.5) return;
+    if (t.textAutoResize !== "HEIGHT") {
+      noteIssue(frame, node, "text-height", `Figma ${Math.round(t.height)}px tall, Pencil ${Math.round(ph)}px`);
+      return;
+    }
+    if (Math.abs(t.width - pw) > 1) {
+      noteIssue(frame, node, "text-box", `text box ${Math.round(t.width)}px wide in Figma, ${Math.round(pw)}px in Pencil`);
+      return;
+    }
+    const fs = typeof t.fontSize === "number" ? t.fontSize : 16;
+    const ls = t.letterSpacing;
+    if (ls === figma.mixed) {
+      noteIssue(
+        frame,
+        node,
+        "text-lines",
+        `${Math.round(t.height / lh)} line(s) in Figma, ${Math.round(ph / lh)} in Pencil after matching Pencil's line breaks`
+      );
+      return;
+    }
+    const base = ls.unit === "PIXELS" ? ls.value : ls.value / 100 * fs;
+    const dir = t.height > ph ? -1 : 1;
+    const step = fs * 4e-3;
+    for (let i = 1; i <= 8; i++) {
+      t.letterSpacing = { value: +(base + dir * step * i).toFixed(3), unit: "PIXELS" };
+      if (Math.abs(t.height - ph) < lh * 0.5) {
+        textFixes++;
+        return;
+      }
+    }
+    t.letterSpacing = ls;
+    noteIssue(
+      frame,
+      node,
+      "text-lines",
+      `${Math.round(t.height / lh)} line(s) in Figma, ${Math.round(ph / lh)} in Pencil \u2014 letter spacing within \xB13% didn't fix it`
+    );
+  }
+  var pinnedSizes = 0;
+  function pinFillToPencil(node, f) {
+    const box = node._box;
+    if (!Array.isArray(box) || f.removed || f.type === "TEXT" || node.rotation || !isRendered(f)) return;
+    if (!("layoutSizingHorizontal" in f) || !("resize" in f)) return;
+    for (const axis of ["Horizontal", "Vertical"]) {
+      const horizontal = axis === "Horizontal";
+      const want = horizontal ? box[2] : box[3];
+      const have = horizontal ? f.width : f.height;
+      if (!(want > 0) || Math.abs(have - want) <= 1) continue;
+      if (sizingMode(horizontal ? node.width : node.height) !== "FILL") continue;
+      try {
+        f["layoutSizing" + axis] = "FIXED";
+        f.resize(horizontal ? want : f.width, horizontal ? f.height : want);
+        pinnedSizes++;
+      } catch (e) {
+      }
+    }
+  }
+  var negativeGaps = 0;
+  function fixOverflowingSpaceBetween(node, f) {
+    if (f.removed || !("primaryAxisAlignItems" in f) || !Array.isArray(node.children)) return;
+    const fr = f;
+    if (fr.layoutMode === "NONE" || fr.primaryAxisAlignItems !== "SPACE_BETWEEN" || !isRendered(fr)) return;
+    const horizontal = fr.layoutMode === "HORIZONTAL";
+    const kids = node.children.map((c, i) => ({ c, fig: fr.children[i] })).filter((k) => k.fig && k.fig.visible && k.c && Array.isArray(k.c._box) && k.c.enabled !== false && k.c.visible !== false && k.c.layoutPosition !== "absolute");
+    if (kids.length < 2) return;
+    const gaps = [];
+    for (let i = 1; i < kids.length; i++) {
+      const a = kids[i - 1].c._box, b = kids[i].c._box;
+      gaps.push(horizontal ? b[0] - (a[0] + a[2]) : b[1] - (a[1] + a[3]));
+    }
+    const g = gaps[0];
+    if (!(g < -0.5) || gaps.some((x) => Math.abs(x - g) > 0.5)) return;
+    try {
+      fr.primaryAxisAlignItems = "MIN";
+      fr.itemSpacing = g;
+      negativeGaps++;
+    } catch (e) {
+    }
+  }
+  function compareBox(frame, node, f) {
+    const box = node._box;
+    if (!Array.isArray(box) || f.removed || !isRendered(f) || node.rotation) return;
+    const [, , pw, ph] = box;
+    if (f.type === "TEXT") {
+      const t = f;
+      const lh = textLineHeightPx(t);
+      if (Math.abs(t.width - pw) > Math.max(2, pw * 0.012)) {
+        noteIssue(frame, node, "size", `width ${Math.round(t.width)} vs Pencil ${Math.round(pw)}`);
+      } else if (Math.abs(t.height - ph) > 1 && Math.abs(t.height - ph) < lh * 0.5) {
+        noteIssue(frame, node, "text-height", `${Math.round(t.height)}px tall in Figma, ${Math.round(ph)}px in Pencil`);
+      }
+      return;
+    }
+    if (Math.abs(f.width - pw) > 1 || Math.abs(f.height - ph) > 1) {
+      noteIssue(
+        frame,
+        node,
+        "size",
+        `${Math.round(f.width * 10) / 10}\xD7${Math.round(f.height * 10) / 10} vs Pencil ${Math.round(pw * 10) / 10}\xD7${Math.round(ph * 10) / 10}` + childDrift(f)
+      );
+    }
+  }
+  function childDrift(f, depth = 0) {
+    if (!("children" in f)) return "";
+    const parts = [];
+    const r = (v) => Math.round(v * 100) / 100;
+    for (const c of f.children) {
+      const n = pencilOf.get(c.id);
+      const b = n && n._box;
+      if (!Array.isArray(b)) continue;
+      const dw = c.width - b[2], dh = c.height - b[3];
+      if (Math.abs(dw) < 0.05 && Math.abs(dh) < 0.05) continue;
+      let what = `${n.name || n.id} ${dw >= 0 ? "+" : ""}${r(dw)}\xD7${dh >= 0 ? "+" : ""}${r(dh)}`;
+      if (c.type === "TEXT") {
+        const t = c;
+        const ls = t.letterSpacing === figma.mixed ? "mixed" : r(letterSpacingPx(t) || 0);
+        what += ` (text ${t.textAutoResize}, ls ${ls})`;
+      }
+      if (c.type !== "TEXT" && depth < 2) {
+        const inner = childDrift(c, depth + 1);
+        if (inner) what += ` [${inner.slice(2)}]`;
+      }
+      parts.push(what);
+      if (parts.length >= 4) break;
+    }
+    return parts.length ? `: ${parts.join("; ")}` : "";
+  }
+  async function checkLayout(frame) {
+    const pairs = builtPairs;
+    builtPairs = [];
+    pencilOf = new Map(pairs.map((p) => [p.fig.id, p.node]));
+    const texts = pairs.filter((p) => p.fig.type === "TEXT" && !p.fig.removed && Array.isArray(p.node._box));
+    for (const { node, fig } of texts) {
+      const t = fig;
+      try {
+        if (t.textAutoResize === "WIDTH_AND_HEIGHT") matchAutoWidth(frame, node, t);
+        else if (t.textAutoResize === "HEIGHT") await matchLineBreaks(frame, node, t);
+        await fixTextLines(frame, node, t);
+        matchCenteredTracking(node, t);
+      } catch (e) {
+        console.warn("[pencil-import] text check failed:", (e == null ? void 0 : e.message) || e);
+      }
+    }
+    for (const { node, fig } of pairs) {
+      try {
+        pinFillToPencil(node, fig);
+      } catch (e) {
+      }
+    }
+    for (const { node, fig } of pairs) {
+      try {
+        fixOverflowingSpaceBetween(node, fig);
+      } catch (e) {
+      }
+    }
+    for (const { node, fig } of pairs) {
+      try {
+        compareBox(frame, node, fig);
+      } catch (e) {
+      }
+    }
+  }
+  function textBoxesOf(frame) {
+    const fb = frame.absoluteBoundingBox;
+    if (!fb || !("findAllWithCriteria" in frame)) return [];
+    const out = [];
+    for (const t of frame.findAllWithCriteria({ types: ["TEXT"] })) {
+      const b = t.absoluteBoundingBox;
+      if (!b || !t.visible) continue;
+      out.push([Math.round(b.x - fb.x), Math.round(b.y - fb.y), Math.round(b.width), Math.round(b.height)]);
+    }
+    return out;
+  }
+  function placeNestedDefinition(node, parent) {
+    const entry = components.get(String(node.id));
+    const n = buildingComponents ? entry.component.createInstance() : entry.component;
+    parent.appendChild(n);
+    if (!buildingComponents) nestedPending.delete(String(node.id));
+    if (node.layoutPosition === "absolute") {
+      try {
+        n.layoutPositioning = "ABSOLUTE";
+      } catch (e) {
+      }
+    }
+    applyChildSizing(n, node);
+    if (node.rotation) n.rotation = node.rotation;
+    if (node.x != null) n.x = node.x;
+    if (node.y != null) n.y = node.y;
+    return n;
+  }
+  function orderDefinitions(defs) {
+    const byId = new Map(defs.map((d) => [String(d.id), d]));
+    const deps = (d) => {
+      const out = /* @__PURE__ */ new Set();
+      (function walk(n, isRoot) {
+        if (!n || typeof n !== "object") return;
+        if (!isRoot && n.reusable === true && n.id != null) out.add(String(n.id));
+        if (n.type === "ref" && n.ref != null) out.add(String(n.ref));
+        if (Array.isArray(n.children)) n.children.forEach((c) => walk(c, false));
+      })(d, true);
+      return out;
+    };
+    const done = /* @__PURE__ */ new Set();
+    const visiting = /* @__PURE__ */ new Set();
+    const order = [];
+    const visit = (id) => {
+      if (done.has(id) || visiting.has(id)) return;
+      const d = byId.get(id);
+      if (!d) return;
+      visiting.add(id);
+      for (const dep of deps(d)) visit(dep);
+      visiting.delete(id);
+      done.add(id);
+      order.push(d);
+    };
+    for (const d of defs) visit(String(d.id));
+    return order;
+  }
+  async function buildComponent(def, parent) {
+    const built = await build(def, parent);
+    const comp = figma.createComponentFromNode(built);
+    const wrapped = !built.removed && built.parent != null && built.parent.id === comp.id;
+    if (wrapped && "constraints" in built) {
+      try {
+        built.constraints = { horizontal: "STRETCH", vertical: "STRETCH" };
+      } catch (e) {
+      }
+    }
+    if (def.name) comp.name = String(def.name);
+    components.set(String(def.id), { component: comp, wrapped });
+    if (wrapped) wrappedMains.add(comp.id);
+    return comp;
+  }
+  var BOX_SHADOW_TYPES = /* @__PURE__ */ new Set(["FRAME", "COMPONENT", "RECTANGLE", "ELLIPSE", "POLYGON", "STAR"]);
+  function hasVisibleFill(n) {
+    if (!("fills" in n)) return false;
+    const fills = n.fills;
+    if (fills === figma.mixed) return true;
+    return fills.some((p) => p.visible !== false && (p.opacity == null || p.opacity > 1e-3));
+  }
+  function hideShadowUnderFill(n) {
+    if (!BOX_SHADOW_TYPES.has(n.type) || !("effects" in n)) return;
+    const f = n;
+    if (!f.effects.some((e) => e.type === "DROP_SHADOW") || !hasVisibleFill(n)) return;
+    try {
+      f.effects = f.effects.map((e) => e.type === "DROP_SHADOW" ? __spreadProps(__spreadValues({}, e), { showShadowBehindNode: false }) : e);
+    } catch (e) {
+    }
+  }
+  function emulateBoxShadow(n, node) {
+    if (n.type !== "FRAME" || node.type !== "frame") return;
+    const f = n;
+    const shadows = f.effects.filter((e) => e.type === "DROP_SHADOW" && e.visible !== false);
+    if (!shadows.length || f.clipsContent) return;
+    if (hasVisibleFill(f)) return;
+    const parent = f.parent;
+    if (!parent || !("insertChild" in parent) || parent.type === "INSTANCE") return;
+    const w = f.width, h = f.height;
+    if (!(w > 0 && h > 0)) return;
+    const margin = Math.ceil(Math.max(...shadows.map((e) => e.radius * 2 + Math.max(Math.abs(e.offset.x), Math.abs(e.offset.y)) + Math.abs(e.spread || 0)))) + 2;
+    const radius = typeof f.cornerRadius === "number" ? f.cornerRadius : 0;
+    const made = [];
+    try {
+      const auto = f.layoutMode !== "NONE";
+      const place = (r, x, y) => {
+        if (auto) {
+          try {
+            r.layoutPositioning = "ABSOLUTE";
+          } catch (e) {
+          }
+        }
+        r.x = x;
+        r.y = y;
+      };
+      const outer = figma.createRectangle();
+      f.appendChild(outer);
+      made.push(outer);
+      place(outer, -margin, -margin);
+      outer.resize(w + 2 * margin, h + 2 * margin);
+      const hole = figma.createRectangle();
+      f.appendChild(hole);
+      made.push(hole);
+      place(hole, 0, 0);
+      hole.resize(w, h);
+      hole.cornerRadius = radius;
+      const ring = figma.subtract([outer, hole], f);
+      made.length = 0;
+      made.push(ring);
+      ring.isMask = true;
+      const caster = figma.createRectangle();
+      f.appendChild(caster);
+      made.push(caster);
+      place(caster, 0, 0);
+      caster.resize(w, h);
+      caster.cornerRadius = radius;
+      caster.fills = [{ type: "SOLID", color: { r: 0, g: 0, b: 0 } }];
+      caster.effects = shadows;
+      const group = figma.group([ring, caster], f);
+      made.length = 0;
+      made.push(group);
+      group.name = "\u0422\u0435\u043D\u044C \u043F\u043E \u0440\u0430\u043C\u043A\u0435";
+      const p = parent;
+      p.insertChild(p.children.indexOf(f), group);
+      if ("layoutMode" in p && p.layoutMode !== "NONE") {
+        try {
+          group.layoutPositioning = "ABSOLUTE";
+        } catch (e) {
+        }
+      }
+      const m = f.relativeTransform;
+      group.relativeTransform = [
+        [m[0][0], m[0][1], m[0][2] - margin * (m[0][0] + m[0][1])],
+        [m[1][0], m[1][1], m[1][2] - margin * (m[1][0] + m[1][1])]
+      ];
+    } catch (e) {
+      for (const m of made) {
+        try {
+          m.remove();
+        } catch (e2) {
+        }
+      }
+      console.warn(`[pencil-import] box shadow for "${node.name || node.id}" left as a content shadow:`, (e == null ? void 0 : e.message) || e);
+    }
+  }
+  function alignToPencilBox(n, node, parent) {
+    const box = node._box;
+    if (!Array.isArray(box) || node.rotation || !("absoluteBoundingBox" in n)) return;
+    if (!("absoluteBoundingBox" in parent)) return;
+    const pb = parent.absoluteBoundingBox;
+    const nb = n.absoluteBoundingBox;
+    if (!pb || !nb) return;
+    const dx = box[0] - (nb.x - pb.x);
+    const dy = box[1] - (nb.y - pb.y);
+    if (Math.abs(dx) < 0.01 && Math.abs(dy) < 0.01) return;
+    try {
+      n.x += dx;
+      n.y += dy;
+    } catch (e) {
+    }
   }
   function countNodes(t) {
     let c = 1;
     if (Array.isArray(t.children)) for (const ch of t.children) c += countNodes(ch);
     return c;
   }
+  var pluginLog = [];
+  var MAX_LOG = 600;
+  for (const level of ["warn", "error"]) {
+    const orig = console[level].bind(console);
+    try {
+      console[level] = (...args) => {
+        if (pluginLog.length < MAX_LOG) {
+          pluginLog.push(`${level}: ` + args.map((a) => typeof a === "string" ? a : (() => {
+            try {
+              return JSON.stringify(a);
+            } catch (e) {
+              return String(a);
+            }
+          })()).join(" "));
+        }
+        orig(...args);
+      };
+    } catch (e) {
+    }
+  }
   figma.ui.onmessage = async (msg) => {
     if (msg.type !== "import") return;
-    const tree = msg.tree;
+    let tree = msg.tree;
+    let defs = Array.isArray(msg.components) ? msg.components : [];
+    if (tree && !Array.isArray(tree) && tree.type == null && tree.tree != null) {
+      if (Array.isArray(tree.components)) defs = tree.components;
+      tree = tree.tree;
+    }
     const opts = msg.opts || {};
     try {
       truncatedNodes = [];
       fontFallbacks = /* @__PURE__ */ new Map();
+      components = /* @__PURE__ */ new Map();
+      wrappedMains = /* @__PURE__ */ new Set();
+      nestedPending = /* @__PURE__ */ new Set();
+      buildingComponents = false;
+      instanceStats = { linked: 0, scaled: 0, detached: 0, reasons: /* @__PURE__ */ new Map() };
+      pinnedSizes = 0;
+      negativeGaps = 0;
+      builtPairs = [];
+      layoutIssues = [];
+      textFixes = 0;
+      trackingShifts = 0;
+      pluginLog = [];
       const roots = Array.isArray(tree) ? tree : [tree];
-      const count = roots.reduce((s, r) => s + countNodes(r), 0);
+      const count = roots.reduce((s, r) => s + countNodes(r), 0) + defs.reduce((s, r) => s + countNodes(r), 0);
       figma.ui.postMessage({ type: "progress", text: `Creating ${count} nodes\u2026` });
       let parent = figma.currentPage;
       let wrapper = null;
@@ -1081,11 +2137,40 @@
         wrapper = w;
         parent = w;
       }
+      const topComponents = [];
+      if (defs.length) {
+        figma.ui.postMessage({ type: "progress", text: `Creating ${defs.length} components\u2026` });
+        buildingComponents = true;
+        try {
+          for (const def of orderDefinitions(defs)) {
+            try {
+              const comp = await buildComponent(def, parent);
+              await checkLayout(String(def.name || def.id));
+              if (def._topLevel === false) nestedPending.add(String(def.id));
+              else topComponents.push(comp);
+            } catch (e) {
+              console.error(`[pencil-import] component "${def.name || def.id}" failed:`, (e == null ? void 0 : e.message) || e);
+            }
+          }
+        } finally {
+          buildingComponents = false;
+        }
+        figma.ui.postMessage({ type: "progress", text: `Creating ${count} nodes\u2026` });
+      }
       const created = [];
+      const pages = [];
       for (const root of roots) {
+        builtPairs = [];
         const node = await build(root, parent);
         created.push(node);
+        pages.push({ root, fig: node });
+        await checkLayout(String(root.name || root.id));
       }
+      for (const id of nestedPending) {
+        const e = components.get(id);
+        if (e) topComponents.push(e.component);
+      }
+      created.push(...topComponents);
       const minX = Math.min(...created.map((c) => c.x));
       const minY = Math.min(...created.map((c) => c.y));
       const maxX = Math.max(...created.map((c) => c.x + c.width));
@@ -1122,12 +2207,57 @@
   ` + fontIssues.join("\n  ")
         );
       }
+      if (layoutIssues.length || textFixes || pinnedSizes) {
+        console.log(
+          `[pencil-import] layout vs Pencil: ${textFixes} text wrap(s) corrected, ${pinnedSizes} fill size(s) pinned, ${layoutIssues.length} mismatch(es)` + (layoutIssues.length ? ":\n  " + layoutIssues.slice(0, 40).map((i) => `${i.frame} \u203A ${i.node}: ${i.kind} \u2014 ${i.detail}`).join("\n  ") : "")
+        );
+      }
+      const detachReasons = [];
+      instanceStats.reasons.forEach((n, why) => detachReasons.push(`${n}\xD7 ${why}`));
+      const componentSummary = components.size ? { components: components.size, linked: instanceStats.linked, scaled: instanceStats.scaled, detached: instanceStats.detached, reasons: detachReasons } : null;
+      if (componentSummary) {
+        console.log(
+          `[pencil-import] ${components.size} component(s), ${instanceStats.linked} linked instance(s), ${instanceStats.detached} detached` + (detachReasons.length ? `:
+  ` + detachReasons.join("\n  ") : "")
+        );
+      }
       figma.ui.postMessage({
         type: "done",
         count,
         truncated: truncatedNodes.length,
-        fontFallbacks: fontIssues
+        fontFallbacks: fontIssues,
+        components: componentSummary,
+        textFixes,
+        layoutIssues: layoutIssues.length,
+        verifying: !!(msg.session && opts.verify !== false)
       });
+      if (msg.session && opts.verify !== false) {
+        figma.ui.postMessage({ type: "progress", text: `Checking ${pages.length} frame(s) against Pencil\u2026` });
+        for (const { root, fig } of pages) {
+          if (fig.removed || !("exportAsync" in fig)) continue;
+          try {
+            const bytes = await fig.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: 1 } });
+            figma.ui.postMessage({ type: "render", id: String(root.id), name: String(root.name || root.id), bytes, texts: textBoxesOf(fig) });
+          } catch (e) {
+            console.warn(`[pencil-import] could not render "${root.name}" for the 1:1 check:`, (e == null ? void 0 : e.message) || e);
+          }
+        }
+        figma.ui.postMessage({
+          type: "renders-done",
+          issues: layoutIssues,
+          diagnostics: {
+            nodes: count,
+            components: componentSummary,
+            textFixes,
+            trackingShifts,
+            pinnedSizes,
+            negativeGaps,
+            fontFallbacks: fontIssues,
+            truncated: truncatedNodes,
+            log: pluginLog
+          }
+        });
+      }
       if (truncatedNodes.length) {
         const names = truncatedNodes.slice(0, 3).join(", ");
         figma.notify(
@@ -1137,6 +2267,11 @@
       } else if (fontIssues.length) {
         figma.notify(
           `Imported ${count} nodes. ${fontIssues.length} font(s) substituted: ${fontIssues.slice(0, 2).join(", ")}${fontIssues.length > 2 ? "\u2026" : ""} \u2014 see console.`,
+          { timeout: 8e3 }
+        );
+      } else if (componentSummary) {
+        figma.notify(
+          `Imported ${count} nodes: ${componentSummary.components} components, ${componentSummary.linked} instances` + (componentSummary.detached ? `, ${componentSummary.detached} detached \u2014 see console` : ""),
           { timeout: 8e3 }
         );
       } else {

@@ -14,7 +14,8 @@
 // app bundle — override with PENCIL_MCP_CMD env var if your install path differs.
 
 import http from "node:http";
-import { mkdtemp, writeFile, rm, mkdir } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, mkdir, readFile, readdir } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { existsSync } from "node:fs";
@@ -22,10 +23,16 @@ import { fileURLToPath } from "node:url";
 import Busboy from "busboy";
 
 import { McpClient, findPencilMcp } from "../exporter/lib/mcp-client.mjs";
+import { connectPencil, ensureDocumentActive } from "../exporter/lib/pencil-api.mjs";
 import { resolveTokens, normalizeVariables } from "../exporter/lib/resolve-tokens.mjs";
 import { availableLibraries } from "../exporter/lib/icon-svg.mjs";
+import { compareRenders } from "../exporter/lib/verify.mjs";
+import { normalizeImageForFigma } from "../exporter/lib/image-normalize.mjs";
 import {
-  RESOLVE_OPTS,
+  annotateLineHeights,
+  attachBoxes,
+  fetchComponentTrees,
+  linkedNodes,
   fetchFullTree,
   countTreeNodes,
   resolveIcons,
@@ -73,7 +80,7 @@ function parseMultipart(req) {
     const bb = Busboy({
       headers: req.headers,
       defParamCharset: "utf8",
-      limits: { fileSize: 50 * 1024 * 1024 },
+      limits: { fileSize: 50 * 1024 * 1024, fieldSize: 10 * 1024 * 1024 },
     });
     /** @type {{name: string, filename: string, mimeType: string, data: Buffer[], size: number}[]} */
     const files = [];
@@ -123,13 +130,15 @@ function imageKey(path) {
 }
 
 /**
- * Build a lookup from {baseName, fullPath, normalizedPath} → base64 data
+ * Build a lookup from {baseName, fullPath, normalizedPath} → { buf, name }. Bytes stay
+ * raw here: only the images a design actually uses get normalised for Figma
+ * (finalizeImages), not every file in a dropped folder.
  */
 function buildImageIndex(files) {
   const index = new Map();
   for (const f of files) {
     if (f.name === "pen") continue;
-    const b64 = f.data.toString("base64");
+    const b64 = { buf: f.data, name: f.filename || "" };
     // The relative path the user dragged from — busboy gives us either "filename" or
     // the original path via webkitRelativePath which the client puts in `field` part.
     // Try multiple keys for robustness.
@@ -171,7 +180,8 @@ function embedImages(tree, index) {
       total++;
       const data = findData(fill.url);
       if (data) {
-        fill.data = data;
+        fill._buf = data.buf;
+        fill._bufName = data.name;
         delete fill.url;
         embedded++;
       } else {
@@ -188,11 +198,29 @@ function embedImages(tree, index) {
     }
     if (Array.isArray(n.fills)) for (const f of n.fills) embedFill(f);
     if (n.stroke && n.stroke.fill) embedFill(n.stroke.fill);
-    if (Array.isArray(n.children)) for (const c of n.children) walk(c);
+    for (const c of linkedNodes(n)) walk(c);
   }
 
   if (Array.isArray(tree)) tree.forEach(walk); else walk(tree);
   return { total, embedded, missing };
+}
+
+// Turn the raw bytes the embed passes attached (`_buf`) into what the plugin gets:
+// normalised for Figma (see image-normalize.mjs), then base64.
+async function finalizeImages(trees) {
+  const notes = [];
+  const fills = [];
+  for (const t of trees) fills.push(...collectImageFills(t));
+  const pending = fills.filter((f) => f._buf);
+  await Promise.all(pending.map(async (f) => {
+    const r = await normalizeImageForFigma(f._buf, f._bufName || "");
+    if (r.changed && r.note) notes.push(`${(f._bufName || "image").split("/").pop()}: ${r.note}`);
+    if (r.error) notes.push(`${(f._bufName || "image").split("/").pop()}: left as is (${r.error})`);
+    f.data = r.buf.toString("base64");
+    delete f._buf;
+    delete f._bufName;
+  }));
+  return [...new Set(notes)];
 }
 
 // ─── Remote image fetching ────────────────────────────────────────────────────
@@ -216,7 +244,7 @@ function collectImageFills(tree) {
     if (n.stroke && n.stroke.fill) {
       if (Array.isArray(n.stroke.fill)) n.stroke.fill.forEach(pushFill); else pushFill(n.stroke.fill);
     }
-    if (Array.isArray(n.children)) for (const c of n.children) walk(c);
+    for (const c of linkedNodes(n)) walk(c);
   }
   if (Array.isArray(tree)) tree.forEach(walk); else walk(tree);
   return out;
@@ -227,7 +255,7 @@ async function embedRemoteImages(trees) {
   for (const t of trees) fills.push(...collectImageFills(t));
   // Only fills that still need data and point at a fetchable http(s) URL.
   const remote = fills.filter(
-    (f) => !f.data && typeof f.url === "string" && /^https?:\/\//i.test(f.url)
+    (f) => !f.data && !f._buf && typeof f.url === "string" && /^https?:\/\//i.test(f.url)
   );
   if (!remote.length) return { total: 0, fetched: 0, failed: [] };
 
@@ -253,9 +281,9 @@ async function embedRemoteImages(trees) {
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const buf = Buffer.from(await resp.arrayBuffer());
-      const b64 = buf.toString("base64");
       for (const f of targets) {
-        f.data = b64;
+        f._buf = buf;
+        f._bufName = url.split("?")[0];
         delete f.url;
       }
       fetched++;
@@ -270,6 +298,160 @@ async function embedRemoteImages(trees) {
 // ─── Design tree, icons and rasterization ────────────────────────────────────
 // All of this lives in exporter/lib/fetch-tree.mjs so the bridge (mode A) and the
 // standalone exporter (mode B) fetch designs through exactly the same pipeline.
+
+// ─── 1:1 check ────────────────────────────────────────────────────────────────
+// After an import the plugin renders every frame it built and posts the PNGs to
+// /verify. The Pencil side of the comparison is rendered here, in the background,
+// as soon as /import has answered — so it is usually ready by the time Figma is.
+// Everything lands in ~/.pencil-to-figma/verify/<run>/: both renders of every frame,
+// a diff overlay for each one that differs, and report.json.
+
+const VERIFY_ROOT = join(homedir(), ".pencil-to-figma", "verify");
+const KEEP_RUNS = 3;
+const sessions = new Map();
+
+function safeName(s) {
+  return String(s || "frame").replace(/[\/:*?"<>|]+/g, "_").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+
+async function renderPencilFrames(workingPath, roots) {
+  const dir = await mkdtemp(join(homedir(), ".pencil-to-figma", "pencil-render-"));
+  const mcp = new McpClient(PENCIL_CMD, PENCIL_ARGS);
+  const errors = [];
+  try {
+    await mcp.start();
+    const api = await connectPencil(mcp, (m) => console.error(m));
+    await api.activeDocument();
+    for (let i = 0; i < roots.length; i += 4) {
+      const ids = roots.slice(i, i + 4).map((r) => r.id);
+      try {
+        await api.exportFrames(ids, dir, workingPath);
+      } catch (e) {
+        errors.push(`${ids.join(", ")}: ${e.message}`);
+      }
+    }
+  } finally {
+    mcp.stop();
+  }
+  const files = new Map();
+  for (const f of await readdir(dir)) {
+    if (f.endsWith(".png")) files.set(f.replace(/\.png$/, ""), join(dir, f));
+  }
+  console.error(`[verify] Pencil rendered ${files.size}/${roots.length} frame(s)${errors.length ? `, ${errors.length} chunk(s) failed` : ""}`);
+  return { dir, files, errors };
+}
+
+function startSession(workingPath, roots) {
+  const id = randomUUID();
+  const session = { id, workingPath, roots, created: Date.now(), pencil: null };
+  if (workingPath && PENCIL_CMD) {
+    session.pencil = renderPencilFrames(workingPath, roots).catch((e) => {
+      console.error(`[verify] Pencil render failed: ${e.message}`);
+      return { dir: null, files: new Map(), errors: [e.message] };
+    });
+  }
+  sessions.set(id, session);
+  // Only the latest few imports can still be verified.
+  for (const [k, v] of sessions) {
+    if (sessions.size <= 5) break;
+    if (v !== session) {
+      v.pencil?.then((r) => r.dir && rm(r.dir, { recursive: true, force: true })).catch(() => {});
+      sessions.delete(k);
+    }
+  }
+  return session;
+}
+
+async function pruneRuns() {
+  try {
+    const runs = (await readdir(VERIFY_ROOT)).filter((d) => /^\d{8}-\d{6}/.test(d)).sort();
+    for (const d of runs.slice(0, Math.max(0, runs.length - KEEP_RUNS))) {
+      await rm(join(VERIFY_ROOT, d), { recursive: true, force: true });
+    }
+  } catch { /* nothing to prune */ }
+}
+
+async function handleVerify(req, res) {
+  try {
+    const { files, fields } = await parseMultipart(req);
+    const session = sessions.get(fields.session || "");
+    if (!session) {
+      return sendJson(res, 404, { error: "This import can't be verified any more — re-import to run the 1:1 check." });
+    }
+    if (!session.pencil) {
+      return sendJson(res, 503, { error: "Pencil renders are unavailable for this import." });
+    }
+    let textBoxes = {};
+    try { textBoxes = JSON.parse(fields.texts || "{}"); } catch {}
+    let issues = [];
+    try { issues = JSON.parse(fields.issues || "[]"); } catch {}
+    let diagnostics = {};
+    try { diagnostics = JSON.parse(fields.diagnostics || "{}"); } catch {}
+
+    const pencil = await session.pencil;
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
+    const runDir = join(VERIFY_ROOT, stamp);
+    await mkdir(runDir, { recursive: true });
+
+    const nameOf = new Map(session.roots.map((r) => [String(r.id), r.name]));
+    const order = new Map(session.roots.map((r, i) => [String(r.id), i]));
+    const frames = [];
+    for (const f of files) {
+      if (f.name !== "render") continue;
+      const id = (f.filename || "").replace(/\.png$/i, "");
+      const name = nameOf.get(id) || id;
+      const base = join(runDir, `${String((order.get(id) ?? 99) + 1).padStart(2, "0")} ${safeName(name)}`);
+      await writeFile(`${base} — figma.png`, f.data);
+      const pencilPath = pencil.files.get(id);
+      if (!pencilPath) {
+        frames.push({ id, name, status: "no-pencil-render", regions: [] });
+        continue;
+      }
+      const pencilBuf = await readFile(pencilPath);
+      await writeFile(`${base} — pencil.png`, pencilBuf);
+      let r;
+      try {
+        r = compareRenders(pencilBuf, f.data, textBoxes[id] || []);
+      } catch (e) {
+        frames.push({ id, name, status: "error", error: e.message, regions: [] });
+        continue;
+      }
+      if (r.overlay) await writeFile(`${base} — diff.png`, r.overlay);
+      frames.push({ id, name, status: r.status, px: r.px, regions: r.regions.slice(0, 12), size: r.size || undefined });
+    }
+    frames.sort((a, b) => (order.get(a.id) ?? 99) - (order.get(b.id) ?? 99));
+
+    const summary = {
+      frames: frames.length,
+      match: frames.filter((f) => f.status === "match").length,
+      differs: frames.filter((f) => f.status === "differs").length,
+      other: frames.filter((f) => !["match", "differs"].includes(f.status)).length,
+      issues: issues.length,
+    };
+    const report = {
+      created: new Date().toISOString(),
+      document: session.workingPath,
+      summary,
+      frames,
+      issues,
+      plugin: diagnostics,
+      pencilRenderErrors: pencil.errors,
+    };
+    await writeFile(join(runDir, "report.json"), JSON.stringify(report, null, 2), "utf8");
+    pruneRuns();
+    console.error(
+      `[verify] ${summary.match}/${summary.frames} frame(s) match` +
+      (summary.differs ? `, ${summary.differs} differ` : "") +
+      (summary.other ? `, ${summary.other} not compared` : "") +
+      (issues.length ? `, ${issues.length} layout issue(s)` : "") +
+      ` → ${runDir}`
+    );
+    return sendJson(res, 200, { dir: runDir, summary, frames, issues: issues.slice(0, 50) });
+  } catch (err) {
+    console.error(`[verify] ${err?.stack || err?.message || err}`);
+    return sendJson(res, 500, { error: err?.message || String(err) });
+  }
+}
 
 // ─── Core handler ─────────────────────────────────────────────────────────────
 
@@ -306,9 +488,10 @@ async function handleImport(req, res) {
     try {
       await mcp.start();
       console.error(`[mcp] started`);
+      const api = await connectPencil(mcp, (m) => console.error(m));
 
       // Pencil MCP can only read the document that is OPEN IN THE EDITOR. It is a
-      // thin shim over the desktop app: `batch_get` with a `filePath` for a file the
+      // thin shim over the desktop app: a read with a `filePath` for a file the
       // app doesn't have open just times out ("you are probably referencing the wrong
       // .pen file"), and `open_document` doesn't exist in every build.
       //
@@ -320,32 +503,35 @@ async function handleImport(req, res) {
       // PEN_ALLOW_MISMATCH=1 is the deliberate escape hatch ("just import what's open").
       const droppedName = (penFile.filename || "design.pen").split("/").pop();
       const doc = await resolveOpenDocument(
-        mcp,
+        api,
         { name: droppedName, bytes: penFile.data },
         process.env.PEN_ALLOW_MISMATCH === "1",
         (m) => console.error(m)
       );
       const workingPath = doc.workingPath;
 
+      // Pencil answers a read for a file it doesn't have open with whatever document
+      // IS open, so make the requested one active before reading anything.
+      if (workingPath) {
+        await ensureDocumentActive(api, workingPath, (m) => console.error(m));
+      }
+
       let topLevel;
       let lastErr = null;
       for (let retry = 0; retry < 3 && !topLevel; retry++) {
         try {
-          const args = { readDepth: 1, ...RESOLVE_OPTS };
-          if (workingPath) args.filePath = workingPath;
-          const result = await mcp.tool("batch_get", args);
-          const arr = Array.isArray(result) ? result : [result];
+          const arr = await api.topLevel(workingPath);
           if (arr.length > 0 && arr[0]) {
-            topLevel = result;
-            console.error(`[mcp] batch_get OK (${arr.length} top-level items)`);
+            topLevel = arr;
+            console.error(`[mcp] read OK (${arr.length} top-level items)`);
             break;
           }
-          // Pencil can race the doc-open against the first batch_get.
-          console.error(`[mcp] batch_get empty, retry ${retry + 1}/3 in 1500ms`);
+          // Pencil can race the doc-open against the first read.
+          console.error(`[mcp] read empty, retry ${retry + 1}/3 in 1500ms`);
           await new Promise((r) => setTimeout(r, 1500));
         } catch (e) {
           lastErr = e;
-          console.error(`[mcp] batch_get error: ${e.message}`);
+          console.error(`[mcp] read error: ${e.message}`);
           break;
         }
       }
@@ -360,12 +546,11 @@ async function handleImport(req, res) {
       //   - If `rootId` was passed explicitly via the form, import just that one.
       //   - Otherwise import every top-level frame that isn't a reusable component
       //     (components are inlined via resolveInstances on their instances).
-      const topLevelArr = Array.isArray(topLevel) ? topLevel : [topLevel];
       let rootIds;
       if (fields.rootId) {
         rootIds = [fields.rootId];
       } else {
-        rootIds = topLevelArr
+        rootIds = topLevel
           .filter((n) => n && n.type === "frame" && n.reusable !== true)
           .map((n) => n.id);
       }
@@ -373,21 +558,33 @@ async function handleImport(req, res) {
       console.error(`[mcp] importing ${rootIds.length} top-level frame(s): ${rootIds.join(", ")}`);
 
       // Variables
-      const varsRaw = await mcp.tool("get_variables", {});
+      const varsRaw = await api.getVariables(workingPath);
       const variables = normalizeVariables(varsRaw);
       console.error(`[mcp] ${Object.keys(variables).length} variables`);
 
       // Deep tree for each root, sequentially (Pencil MCP doesn't love parallel calls).
-      console.error(`[mcp] fetching full trees from ${workingPath}…`);
-      const trees = [];
+      // Components mode keeps instances as `ref` nodes and ships the reusable
+      // definitions alongside, so the plugin can build real Figma components.
+      const withComponents = fields.components === "1";
+      console.error(`[mcp] fetching full trees from ${workingPath}${withComponents ? " (components mode)" : ""}…`);
+      let trees = [];
+      let componentDefs = [];
+      let instanceCount = 0;
       let incompleteRoots = 0;
-      for (const id of rootIds) {
-        try {
-          const r = await fetchFullTree(mcp, id, workingPath, (m) => console.error(m));
-          trees.push(r.tree);
-          if (r.incomplete) incompleteRoots += r.incomplete;
-        } catch (e) {
-          console.error(`[mcp] failed to fetch ${id}: ${e.message}`);
+      if (withComponents) {
+        const r = await fetchComponentTrees(api, rootIds, workingPath, (m) => console.error(m));
+        trees = r.trees;
+        componentDefs = r.components;
+        instanceCount = r.refs;
+      } else {
+        for (const id of rootIds) {
+          try {
+            const r = await fetchFullTree(api, id, workingPath, (m) => console.error(m));
+            trees.push(r.tree);
+            if (r.incomplete) incompleteRoots += r.incomplete;
+          } catch (e) {
+            console.error(`[mcp] failed to fetch ${id}: ${e.message}`);
+          }
         }
       }
       if (!trees.length) throw new Error("Failed to fetch any frames");
@@ -395,8 +592,18 @@ async function handleImport(req, res) {
         console.error(`[mcp] WARNING only ${trees.length}/${rootIds.length} top-level frames were fetched`);
       }
 
-      // Resolve any remaining $token strings (defensive pass)
+      // Resolve any remaining $token strings (defensive pass). Component definitions
+      // go through every pass below with the pages — `all` is the list to walk.
       const resolved = trees.map((t) => resolveTokens(t, variables));
+      const components = componentDefs.map((t) => resolveTokens(t, variables));
+      const all = [...resolved, ...components];
+
+      try {
+        await attachBoxes(api, all, workingPath, (m) => console.error(m));
+      } catch (e) {
+        console.error(`[layout] failed: ${e.message}`);
+      }
+      annotateLineHeights(all, (m) => console.error(m));
 
       // `icon` nodes (lucide / phosphor / Material Symbols / feather) have no native
       // Figma equivalent, so we supply real vectors where we can and rasterize the
@@ -406,14 +613,14 @@ async function handleImport(req, res) {
       // round-trip (and its occasional hang on large batches).
       let fillSummary = null;
       try {
-        fillSummary = await resolveUnsupportedFills(mcp, resolved, workingPath, (m) => console.error(m));
+        fillSummary = await resolveUnsupportedFills(api, all, workingPath, (m) => console.error(m));
       } catch (e) {
         console.error(`[fills] processing failed: ${e.message}`);
       }
 
       let iconSummary = null;
       try {
-        iconSummary = await resolveIcons(mcp, resolved, workingPath, (m) => console.error(m));
+        iconSummary = await resolveIcons(api, all, workingPath, (m) => console.error(m));
       } catch (e) {
         console.error(`[icons] processing failed: ${e.message}`);
       }
@@ -422,7 +629,7 @@ async function handleImport(req, res) {
       // the uploaded local files. Run before the local pass so these fills already
       // carry `data` (url deleted) and aren't double-counted as "missing" below.
       try {
-        const remoteStats = await embedRemoteImages(resolved);
+        const remoteStats = await embedRemoteImages(all);
         if (remoteStats.total) {
           console.error(
             `[remote] embedded ${remoteStats.fetched}/${remoteStats.total} remote image(s)` +
@@ -437,12 +644,16 @@ async function handleImport(req, res) {
       const imageIndex = buildImageIndex(files);
       let totalImages = 0, embeddedImages = 0;
       const missingAll = [];
-      for (const t of resolved) {
+      for (const t of all) {
         const s = embedImages(t, imageIndex);
         totalImages += s.total;
         embeddedImages += s.embedded;
         missingAll.push(...s.missing);
       }
+      // Every image that ended up in the design, made Figma-safe: ≤4096px, sRGB.
+      const imageNotes = await finalizeImages(all);
+      for (const n of imageNotes) console.error(`[images] ${n}`);
+
       const nodeCount = resolved.reduce((s, t) => s + countTreeNodes(t), 0);
       const stats = {
         total: totalImages,
@@ -452,6 +663,7 @@ async function handleImport(req, res) {
         icons: iconSummary,
         unsupportedFills: fillSummary,
         incompleteSubtrees: incompleteRoots,
+        components: withComponents ? { definitions: components.length, instances: instanceCount } : null,
         // Which document this actually came from, so an unverifiable import can't
         // pass for a verified one in the UI.
         document: {
@@ -470,11 +682,22 @@ async function handleImport(req, res) {
         const debugDir = join(homedir(), ".pencil-to-figma", "debug");
         if (!existsSync(debugDir)) await mkdir(debugDir, { recursive: true });
         const debugFile = join(debugDir, `bridge-${Date.now()}.json`);
-        await writeFile(debugFile, JSON.stringify({ tree: resolved, stats }, null, 2), "utf8");
+        await writeFile(debugFile, JSON.stringify({ tree: resolved, components, stats }, null, 2), "utf8");
         console.error(`[debug] full payload saved to ${debugFile}`);
       }
 
-      return sendJson(res, 200, { tree: resolved, stats, rootIds, variables: Object.keys(variables).length });
+      // Start rendering the Pencil side of the 1:1 check right away.
+      const nameById = new Map(topLevel.map((n) => [String(n.id), n.name]));
+      const session = startSession(workingPath, rootIds.map((id) => ({ id, name: nameById.get(String(id)) || id })));
+
+      return sendJson(res, 200, {
+        session: session.id,
+        tree: resolved,
+        components: withComponents ? components : undefined,
+        stats,
+        rootIds,
+        variables: Object.keys(variables).length,
+      });
     } finally {
       mcp.stop();
     }
@@ -499,6 +722,9 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
     return sendText(res, 200, "pencil-to-figma bridge ok");
+  }
+  if (req.method === "POST" && req.url === "/verify") {
+    return handleVerify(req, res);
   }
   if (req.method === "POST" && req.url === "/import") {
     return handleImport(req, res);

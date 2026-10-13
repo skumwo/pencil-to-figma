@@ -4,6 +4,8 @@
 import { readFile } from "node:fs/promises";
 import { join, isAbsolute, dirname } from "node:path";
 import { existsSync } from "node:fs";
+import { linkedNodes } from "./fetch-tree.mjs";
+import { normalizeImageForFigma } from "./image-normalize.mjs";
 
 /**
  * Walk a node tree, replace image fill URLs with embedded base64 bytes.
@@ -27,7 +29,9 @@ export async function embedImages(tree, baseDir, extraSearch = []) {
     for (const p of candidates) {
       if (existsSync(p)) {
         const bytes = await readFile(p);
-        const b64 = bytes.toString("base64");
+        // ≤4096px and sRGB, or Figma refuses / mis-colours it (image-normalize.mjs).
+        const { buf } = await normalizeImageForFigma(bytes, p);
+        const b64 = buf.toString("base64");
         cache.set(name, b64);
         return b64;
       }
@@ -63,7 +67,7 @@ export async function embedImages(tree, baseDir, extraSearch = []) {
       await embedFills(node.text.fill);
       await embedFills(node.text.fills);
     }
-    if (Array.isArray(node.children)) for (const c of node.children) await walk(c);
+    for (const c of linkedNodes(node)) await walk(c);
   }
 
   async function embedFill(fill) {

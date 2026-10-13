@@ -23,6 +23,7 @@
     "@phosphor-icons/core": "^2.1.1",
     "busboy": "^1.6.0",
     "feather-icons": "^4.29.2",
-    "lucide-static": "^1.21.0"
+    "lucide-static": "^1.21.0",
+    "pngjs": "^7.0.0"
   }
 }

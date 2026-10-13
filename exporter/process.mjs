@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Post-processor for an already-captured Pencil tree + variables file.
 //
-// This is the back half of mode B: when the tree was captured by an MCP client that
-// already exists (Claude Code's Pencil MCP, via the /pen-export slash command),
-// spawning a second client would fail — Pencil serves one at a time. So the client
-// fetches the tree and this script does everything that needs no MCP:
+// The fallback back half of mode B: when the tree was captured by an MCP client that
+// already exists (Claude Code's Pencil MCP, via the /pen-export slash command) and
+// the CLI can't spawn its own — older Pencil builds served one client at a time. The
+// client fetches the tree and this script does everything that needs no MCP:
 //   - resolve $token refs to concrete values
 //   - attach real SVG vectors to `icon` nodes
 //   - embed image fills as base64
